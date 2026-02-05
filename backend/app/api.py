@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .config import settings
-from .gamma import GammaClient
+from .gamma import GammaClient, list_events as gamma_list_events
 from .monitor import Monitor
 
 # NOTE:
@@ -357,3 +357,54 @@ async def gamma_market(slug: str) -> JSONResponse:
     market["clobTokenIds"] = tids
     market["clob_token_ids"] = tids
     return JSONResponse(content=market)
+
+
+@app.get("/gamma/active_markets")
+async def gamma_active_markets(limit: int = 100, offset: int = 0) -> JSONResponse:
+    """
+    Enumerate ACTIVE markets (event-based; best-effort).
+    Response shape: { markets: [...], events_n: n, markets_n: m, limit, offset }
+    """
+    data = await gamma_list_events(limit=limit, offset=offset, active=True, closed=False)
+
+    events = data if isinstance(data, list) else data.get("events") or data.get("data") or []
+    out_markets: List[Dict[str, Any]] = []
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        ev_id = ev.get("id")
+        ev_title = ev.get("title") or ev.get("name")
+        ev_slug = ev.get("slug")
+        ev_start = ev.get("startDate") or ev.get("start_date")
+        ev_end = ev.get("endDate") or ev.get("end_date")
+        ev_closed = ev.get("closed")
+        ev_active = ev.get("active")
+        ev_archived = ev.get("archived")
+
+        markets = ev.get("markets") or []
+        if not isinstance(markets, list):
+            continue
+
+        for m in markets:
+            if not isinstance(m, dict):
+                continue
+            mm = dict(m)
+            mm["event_id"] = ev_id
+            mm["event_title"] = ev_title
+            mm["event_slug"] = ev_slug
+            mm["event_start"] = ev_start
+            mm["event_end"] = ev_end
+            mm["event_active"] = ev_active
+            mm["event_closed"] = ev_closed
+            mm["event_archived"] = ev_archived
+            out_markets.append(mm)
+
+    return JSONResponse(
+        content={
+            "limit": limit,
+            "offset": offset,
+            "events_n": len(events),
+            "markets": out_markets,
+            "markets_n": len(out_markets),
+        }
+    )

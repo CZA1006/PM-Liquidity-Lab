@@ -1,18 +1,21 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   gammaMarket,
+  monitorSetTokens,
+  monitorStatus,
   normalizeClobTokenIds,
   openMetricsStream,
   type MetricsTick
 } from "@/lib/api";
+import MarketCard from "@/components/MarketCard";
+import { loadWatchlist, removeFromWatchlist } from "@/lib/watchlist";
 
-const LS_KEY = "pmliq_watchlist_slugs";
 const MAX_MARKETS = 12;
 
-type CardMarket = {
+type Item = {
   slug: string;
   question: string;
   tokens: string[];
@@ -20,19 +23,15 @@ type CardMarket = {
 
 export default function WatchlistView() {
   const [slugs, setSlugs] = useState<string[]>([]);
-  const [items, setItems] = useState<CardMarket[]>([]);
+  const [items, setItems] = useState<Item[]>([]);
   const [tickByToken, setTickByToken] = useState<Record<string, MetricsTick>>({});
+  const [status, setStatus] = useState<any | null>(null);
+  const didApplyTokens = useRef(false);
 
   // load slugs from localStorage
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem(LS_KEY);
-      const arr = raw ? (JSON.parse(raw) as any[]) : [];
-      const xs = Array.isArray(arr) ? arr.map(String).filter(Boolean) : [];
-      setSlugs(xs.slice(0, MAX_MARKETS));
-    } catch {
-      setSlugs([]);
-    }
+    const xs = loadWatchlist();
+    setSlugs(xs.slice(0, MAX_MARKETS));
   }, []);
 
   // fetch market details
@@ -40,7 +39,7 @@ export default function WatchlistView() {
     let cancelled = false;
     (async () => {
       const xs = slugs.slice(0, MAX_MARKETS);
-      const out: CardMarket[] = [];
+      const out: Item[] = [];
       for (const slug of xs) {
         try {
           const m = await gammaMarket(slug);
@@ -71,6 +70,26 @@ export default function WatchlistView() {
     return Array.from(new Set(xs));
   }, [items]);
 
+  // Apply union tokens to backend monitor once (and whenever watchlist changes materially).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!tokenSet.length) return;
+      try {
+        const restart = !didApplyTokens.current;
+        didApplyTokens.current = true;
+        await monitorSetTokens(tokenSet, restart);
+        const s = await monitorStatus();
+        if (!cancelled) setStatus(s);
+      } catch {
+        // If backend monitor is not running, watchlist still renders using SSE ticks.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [tokenSet.join("|")]);
+
   // single SSE stream, update ticks for any watched tokens
   useEffect(() => {
     if (!tokenSet.length) return;
@@ -93,9 +112,8 @@ export default function WatchlistView() {
   }, [tokenSet.join("|")]);
 
   function removeSlug(s: string) {
-    const next = slugs.filter((x) => x !== s);
-    setSlugs(next);
-    localStorage.setItem(LS_KEY, JSON.stringify(next));
+    const next = removeFromWatchlist(s);
+    setSlugs(next.slice(0, MAX_MARKETS));
   }
 
   return (
@@ -106,76 +124,31 @@ export default function WatchlistView() {
             ← Back
           </Link>
           <h1 className="text-xl font-semibold">Watchlist</h1>
-          <div className="text-xs text-zinc-400">
-            saved in localStorage (“{LS_KEY}”), max {MAX_MARKETS} markets
+          <div className="text-xs text-zinc-400">saved in localStorage, max {MAX_MARKETS} markets</div>
+          <div className="text-xs text-zinc-500">
+            monitor: started={String(status?.started ?? "—")} ws={String(status?.ws_connected ?? "—")} token_n=
+            {status?.token_ids?.length ?? tokenSet.length}
           </div>
         </div>
       </div>
 
       {items.length === 0 ? (
         <div className="text-sm text-zinc-400">
-          No markets in watchlist yet. Open a market page and add its slug into localStorage key "{LS_KEY}".
+          No markets in watchlist yet. Use Search on the home page and click “☆ Watch” to save markets.
         </div>
       ) : (
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
-          {items.map((it) => {
-            const yes = it.tokens[0];
-            const no = it.tokens[1];
-            const ty = yes ? tickByToken[yes]?.metrics ?? {} : {};
-            const tn = no ? tickByToken[no]?.metrics ?? {} : {};
-
-            const ymid = typeof ty?.mid === "number" ? ty.mid : null;
-            const nmid = typeof tn?.mid === "number" ? tn.mid : null;
-            const ysp = typeof ty?.spread_bps === "number" ? ty.spread_bps : null;
-            const nsp = typeof tn?.spread_bps === "number" ? tn.spread_bps : null;
-
-            return (
-              <div key={it.slug} className="rounded-lg border border-zinc-800 bg-zinc-950/40 p-4">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <Link className="text-sm font-semibold underline" href={`/market/${encodeURIComponent(it.slug)}`}>
-                      {it.question}
-                    </Link>
-                    <div className="mt-1 font-mono text-xs text-zinc-500 break-all">{it.slug}</div>
-                  </div>
-                  <button
-                    className="text-xs text-zinc-400 underline"
-                    onClick={() => removeSlug(it.slug)}
-                  >
-                    remove
-                  </button>
-                </div>
-
-                <div className="mt-3 grid grid-cols-2 gap-3 text-sm">
-                  <div className="rounded border border-zinc-800 p-3">
-                    <div className="text-xs text-zinc-400">YES</div>
-                    <div className="mt-1">mid: <span className="font-mono">{ymid ?? "—"}</span></div>
-                    <div className="mt-1">spread_bps: <span className="font-mono">{ysp ?? "—"}</span></div>
-                    {yes ? (
-                      <div className="mt-2 text-[10px] text-zinc-500" title={yes}>
-                        token: {yes.slice(0, 8)}…{yes.slice(-6)}
-                      </div>
-                    ) : null}
-                  </div>
-
-                  <div className="rounded border border-zinc-800 p-3">
-                    <div className="text-xs text-zinc-400">NO</div>
-                    <div className="mt-1">mid: <span className="font-mono">{nmid ?? "—"}</span></div>
-                    <div className="mt-1">spread_bps: <span className="font-mono">{nsp ?? "—"}</span></div>
-                    {no ? (
-                      <div className="mt-2 text-[10px] text-zinc-500" title={no}>
-                        token: {no.slice(0, 8)}…{no.slice(-6)}
-                      </div>
-                    ) : null}
-                  </div>
-                </div>
-
-                <div className="mt-3 text-xs text-zinc-500">
-                  ticks: {yes && tickByToken[yes]?.ts_ms ? "YES✅" : "YES—"} / {no && tickByToken[no]?.ts_ms ? "NO✅" : "NO—"}
-                </div>
-              </div>
-            );
-          })}
+          {items.map((it) => (
+            <MarketCard
+              key={it.slug}
+              slug={it.slug}
+              title={it.question}
+              outcomes={["YES", "NO"]}
+              tokenIds={[it.tokens[0] ?? null, it.tokens[1] ?? null]}
+              ticksByToken={tickByToken}
+              onRemove={() => removeSlug(it.slug)}
+            />
+          ))}
         </div>
       )}
     </section>

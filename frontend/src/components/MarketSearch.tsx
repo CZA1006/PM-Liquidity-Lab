@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import Link from "next/link";
 import { gammaSearch } from "@/lib/api";
+import { addToWatchlist, loadWatchlist, removeFromWatchlist } from "@/lib/watchlist";
 
 type MarketItem = {
   slug: string;
@@ -30,6 +31,7 @@ export default function MarketSearch() {
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [resp, setResp] = useState<any | null>(null);
+  const [wl, setWl] = useState<string[]>(() => loadWatchlist());
 
   const markets = useMemo(() => (resp ? extractMarkets(resp) : []), [resp]);
 
@@ -48,7 +50,17 @@ export default function MarketSearch() {
 
   return (
     <section className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-4">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+      <div className="flex items-baseline justify-between gap-3">
+        <h1 className="text-xl font-semibold">PM Liquidity Lab</h1>
+        <div className="flex items-center gap-3 text-sm">
+          <Link href="/watchlist" className="underline">
+            Watchlist
+          </Link>
+          <div className="text-xs text-zinc-400">watched: {wl.length}</div>
+        </div>
+      </div>
+
+      <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center">
         <input
           value={q}
           onChange={(e) => setQ(e.target.value)}
@@ -72,14 +84,33 @@ export default function MarketSearch() {
 
       <div className="mt-3 grid grid-cols-1 gap-3">
         {markets.slice(0, 20).map((m) => (
-          <Link
+          <div
             key={m.slug}
-            href={`/market/${encodeURIComponent(m.slug)}`}
-            className="rounded-md border border-zinc-800 bg-zinc-950/40 p-3 hover:border-zinc-700"
+            className="flex items-start justify-between gap-3 rounded-md border border-zinc-800 bg-zinc-950/40 p-3 hover:border-zinc-700"
           >
-            <div className="text-sm font-semibold">{m.question ?? m.slug}</div>
-            <div className="mt-1 font-mono text-xs text-zinc-400">{m.slug}</div>
-          </Link>
+            <Link className="min-w-0 flex-1" href={`/market/${encodeURIComponent(m.slug)}`}>
+              <div className="text-sm font-semibold">{m.question ?? m.slug}</div>
+              <div className="mt-1 font-mono text-xs text-zinc-400 break-all">{m.slug}</div>
+            </Link>
+
+            {wl.includes(m.slug) ? (
+              <button
+                className="shrink-0 rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-xs text-zinc-200 hover:border-zinc-600"
+                onClick={() => setWl(removeFromWatchlist(m.slug))}
+                title="Remove from watchlist"
+              >
+                ★ Watched
+              </button>
+            ) : (
+              <button
+                className="shrink-0 rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-xs text-zinc-200 hover:border-zinc-600"
+                onClick={() => setWl(addToWatchlist(m.slug))}
+                title="Add to watchlist"
+              >
+                ☆ Watch
+              </button>
+            )}
+          </div>
         ))}
       </div>
     </section>

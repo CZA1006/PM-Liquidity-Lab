@@ -8,6 +8,7 @@ import time
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import websockets
+from websockets.exceptions import ConnectionClosed
 
 log = logging.getLogger("ws")
 
@@ -29,27 +30,21 @@ class MarketWsClient:
         backoff = 1.0
         while not stop_event.is_set():
             try:
-                async with websockets.connect(self.url, ping_interval=None, close_timeout=5) as ws:
+                async with websockets.connect(
+                    self.url,
+                    ping_interval=20,
+                    ping_timeout=10,
+                    close_timeout=5,
+                    max_queue=2048,
+                ) as ws:
                     # initial subscribe
                     sub = {"type": "market", "assets_ids": token_ids}
                     await ws.send(json.dumps(sub))
                     log.info(f"WS connected {self.url}, subscribed tokens={len(token_ids)}")
 
                     backoff = 1.0
-                    last_ping = time.time()
 
                     while not stop_event.is_set():
-                        # manual ping every 15s
-                        now = time.time()
-                        if now - last_ping > 15:
-                            try:
-                                pong_waiter = await ws.ping()
-                                await asyncio.wait_for(pong_waiter, timeout=10)
-                            except Exception:
-                                log.warning("ping failed; forcing reconnect")
-                                break
-                            last_ping = now
-
                         try:
                             msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
                         except asyncio.TimeoutError:
@@ -65,6 +60,12 @@ class MarketWsClient:
                         else:
                             yield data
 
+            except ConnectionClosed as e:
+                if stop_event.is_set():
+                    break
+                log.warning(f"WS disconnected: {e!r}")
+                await asyncio.sleep(backoff + random.random() * 0.2)
+                backoff = min(backoff * 2, 30.0)
             except Exception as e:
                 if stop_event.is_set():
                     break

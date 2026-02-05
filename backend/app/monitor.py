@@ -11,6 +11,7 @@ from .config import Settings
 from .gamma import GammaClient, pick_tokens_from_markets
 from .normalize import extract_exchange_ts_ms, normalize_book
 from .storage import JsonlEventWriter, default_eventlog_path, default_run_dir, ensure_dir, safe_write
+from .raw_log import RawLogWriter
 from .ws_client import MarketWsClient
 
 
@@ -64,6 +65,9 @@ class MonitorStatus:
     ws_other_msgs: int
     rest_polls: int
     rebase_count: int
+    raw_log_path: str = ""
+    raw_events_written: int = 0
+    raw_log_dir: str = ""
 
 
 class MetricsHub:
@@ -118,6 +122,7 @@ class Monitor:
         ensure_dir(run_dir)
         eventlog_path = default_eventlog_path(settings.DATA_DIR, settings.RUN_ID)
         self.writer = JsonlEventWriter(eventlog_path, run_id=self.run_id)
+        self.raw = RawLogWriter(self.run_id)
 
         self.hub = MetricsHub(queue_max=settings.MONITOR_SSE_QUEUE_MAX)
 
@@ -137,6 +142,7 @@ class Monitor:
         self.ws_other_msgs: int = 0
         self.rest_polls: int = 0
         self.rebase_count: int = 0
+        self.last_trade_price: Dict[str, float] = {}
 
     def _write_event(self, *, event: str, schema: str, **fields: Any) -> None:
         safe_write(
@@ -149,6 +155,12 @@ class Monitor:
                 stage=event,
             ),
         )
+
+    def _raw_write(self, kind: str, payload: Dict[str, Any], token_id: Optional[str] = None) -> None:
+        try:
+            self.raw.write(kind, payload, token_id=token_id)
+        except Exception:
+            pass
 
     async def start(self) -> None:
         if self._started:
@@ -185,6 +197,10 @@ class Monitor:
         self._tasks = []
         self._started = False
         self.ws_connected = False
+        try:
+            self.raw.close()
+        except Exception:
+            pass
         self._write_event(
             event="monitor_stop",
             schema="monitor_stop_v1",
@@ -202,6 +218,9 @@ class Monitor:
             ws_other_msgs=self.ws_other_msgs,
             rest_polls=self.rest_polls,
             rebase_count=self.rebase_count,
+            raw_log_path=self.raw.status.file_path,
+            raw_events_written=self.raw.status.written,
+            raw_log_dir=self.raw.status.dir_path,
         )
 
     def _empty_metrics_tick(self, token_id: str) -> Dict[str, Any]:
@@ -343,6 +362,11 @@ class Monitor:
         if not isinstance(tid, str) or not tid:
             return
 
+        ltp = self.last_trade_price.get(tid)
+        if ltp is not None:
+            snap = dict(snap)
+            snap["last_trade_price"] = ltp
+
         metrics = compute_liquidity_metrics(
             snap,
             notional_list=list(self.settings.LIQ_NOTIONALS),
@@ -383,6 +407,7 @@ class Monitor:
         tid = nb.get("token_id") or ""
         if not tid or tid not in self.book_states:
             return
+        self._raw_write("ws_book", {"msg": msg}, token_id=tid)
         self.book_states[tid].apply_snapshot(
             nb.get("bids") or [],
             nb.get("asks") or [],
@@ -391,6 +416,33 @@ class Monitor:
             exchange_ts_ms=nb.get("exchange_ts_ms"),
         )
         await self._publish_metrics_from_snapshot(nb, source="ws", reason="ws_book")
+
+    @staticmethod
+    def _extract_token_id(msg: Dict[str, Any]) -> Optional[str]:
+        for k in ("asset_id", "token_id", "assetId", "tokenId", "id"):
+            v = msg.get(k)
+            if isinstance(v, str) and v:
+                return v
+        d = msg.get("data")
+        if isinstance(d, dict):
+            for k in ("asset_id", "token_id", "assetId", "tokenId", "id"):
+                v = d.get(k)
+                if isinstance(v, str) and v:
+                    return v
+        return None
+
+    def _snapshot_from_state(self, token_id: str) -> Optional[Dict[str, Any]]:
+        st = self.book_states.get(token_id)
+        if not st:
+            return None
+        bids = [[p, s] for p, s in st.bids.items()]
+        asks = [[p, s] for p, s in st.asks.items()]
+        return {
+            "token_id": token_id,
+            "bids": bids,
+            "asks": asks,
+            "exchange_ts_ms": st.exchange_ts_ms,
+        }
 
     async def _ws_loop(self) -> None:
         ws = MarketWsClient(self.settings.CLOB_WS_BASE, channel=self.settings.CLOB_WS_CHANNEL)
@@ -419,13 +471,40 @@ class Monitor:
                             await self._handle_book_msg(item)
                         else:
                             self.ws_other_msgs += 1
+                            et = str(item.get("event_type") or item.get("eventType") or item.get("type") or "").lower()
+                            self._raw_write("ws_other", {"event_type": et, "msg": item})
                     continue
 
+                et = str(msg.get("event_type") or msg.get("eventType") or msg.get("type") or "").lower()
                 if msg.get("event_type") == "book" or ("bids" in msg and "asks" in msg):
                     self.ws_book_msgs += 1
                     await self._handle_book_msg(msg)
                 else:
+                    if et in ("price_change", "last_trade_price", "trade", "last_trade"):
+                        token_id = self._extract_token_id(msg)
+                        if token_id:
+                            try:
+                                price = msg.get("price") or msg.get("last_trade_price") or msg.get("lastTradePrice")
+                                if price is None and isinstance(msg.get("data"), dict):
+                                    d = msg["data"]
+                                    price = d.get("price") or d.get("last_trade_price") or d.get("lastTradePrice")
+                                p = float(price) if price is not None else None
+                            except Exception:
+                                p = None
+                            if p is not None:
+                                self.last_trade_price[token_id] = p
+                            self._raw_write(
+                                "ws_price_change",
+                                {"event_type": et, "price": p, "msg": msg},
+                                token_id=token_id,
+                            )
+                            snap = self._snapshot_from_state(token_id)
+                            if snap:
+                                await self._publish_metrics_from_snapshot(snap, source="ws", reason=et)
+                            self.ws_other_msgs += 1
+                            continue
                     self.ws_other_msgs += 1
+                    self._raw_write("ws_other", {"event_type": et, "msg": msg})
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -476,6 +555,15 @@ class Monitor:
                         )
                         cur = self.book_states[tid]
                         mismatch_levels = compare_top_n(cur, snap_state, top_n)
+                        self._raw_write(
+                            "rest_snapshot",
+                            {
+                                "token_id": tid,
+                                "mismatch_levels": mismatch_levels,
+                                "snapshot_keys": list(raw.keys()),
+                            },
+                            token_id=tid,
+                        )
                         if mismatch_levels >= mismatch_threshold:
                             self.book_states[tid].apply_snapshot(
                                 nb.get("bids") or [],
@@ -485,6 +573,15 @@ class Monitor:
                                 exchange_ts_ms=nb.get("exchange_ts_ms"),
                             )
                             self.rebase_count += 1
+                            self._raw_write(
+                                "rebase",
+                                {
+                                    "token_id": tid,
+                                    "mismatch_levels": mismatch_levels,
+                                    "threshold": mismatch_threshold,
+                                },
+                                token_id=tid,
+                            )
                             self._write_event(
                                 event="rebase",
                                 schema="rebase_v1",

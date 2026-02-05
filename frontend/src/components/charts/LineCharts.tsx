@@ -65,6 +65,11 @@ function inferStyle(name: string): Required<LineSeriesStyle> {
   return { color, lineStyle, lineWidth };
 }
 
+function inferColor(spec: LineSeriesSpec): string {
+  if (spec.style?.color) return spec.style.color;
+  return inferStyle(spec.name).color;
+}
+
 export default function LineChart(props: {
   title: string;
   height?: number;
@@ -197,6 +202,21 @@ export default function LineChart(props: {
       <div className="flex items-baseline justify-between gap-3">
         <div className="text-sm font-semibold text-zinc-200">{title}</div>
         <div className="text-xs text-zinc-400">{hoverText}</div>
+      </div>
+      <div className="mt-2 flex flex-wrap gap-2">
+        {series.map((s) => (
+          <div
+            key={s.id}
+            className="inline-flex items-center gap-2 rounded border border-zinc-800 bg-zinc-950/30 px-2 py-1 text-xs text-zinc-300"
+            title={s.name}
+          >
+            <span
+              className="h-2 w-2 rounded-full"
+              style={{ background: inferColor(s) }}
+            />
+            <span className="max-w-[18rem] truncate">{s.name}</span>
+          </div>
+        ))}
       </div>
       <div ref={boxRef} className="mt-2 w-full" />
     </div>

@@ -13,6 +13,7 @@ import {
   type MetricsTick
 } from "@/lib/api";
 import LineChart, { type LinePoint, type LineSeriesSpec } from "@/components/charts/LineCharts";
+import { addToWatchlist, loadWatchlist, removeFromWatchlist } from "@/lib/watchlist";
 
 type Pt = { t: number; v: number | null };
 
@@ -73,6 +74,12 @@ export default function MarketView({ slug }: { slug: string }) {
   const [market, setMarket] = useState<any | null>(null);
   const [status, setStatus] = useState<any | null>(null);
   const [busy, setBusy] = useState(false);
+  const [watched, setWatched] = useState<boolean>(false);
+
+  useEffect(() => {
+    const wl = loadWatchlist();
+    setWatched(wl.includes(slug));
+  }, [slug]);
 
   const [tickByToken, setTickByToken] = useState<Record<string, MetricsTick>>({});
   const [lastHeartbeat, setLastHeartbeat] = useState<number | null>(null);
@@ -167,6 +174,16 @@ export default function MarketView({ slug }: { slug: string }) {
       setErr(e?.message ?? String(e));
     } finally {
       setBusy(false);
+    }
+  }
+
+  function toggleWatchlist() {
+    if (watched) {
+      removeFromWatchlist(slug);
+      setWatched(false);
+    } else {
+      addToWatchlist(slug);
+      setWatched(true);
     }
   }
 
@@ -332,6 +349,21 @@ export default function MarketView({ slug }: { slug: string }) {
         </div>
 
         <div className="flex flex-col items-end gap-2">
+          <div className="flex gap-2">
+            <button
+              onClick={toggleWatchlist}
+              className="rounded-md border border-zinc-600 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 hover:border-zinc-500"
+              title={watched ? "Remove from watchlist" : "Add to watchlist"}
+            >
+              {watched ? "★ Watched" : "☆ Watch"}
+            </button>
+            <Link
+              href="/watchlist"
+              className="rounded-md border border-zinc-600 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 hover:border-zinc-500"
+            >
+              Watchlist
+            </Link>
+          </div>
           <button
             onClick={() => applyTokens(true)}
             disabled={busy || tokens.length === 0}
@@ -363,6 +395,30 @@ export default function MarketView({ slug }: { slug: string }) {
         <LineChart title="spread_bps (YES/NO)" series={spreadSeries} valueFormatter={(v) => v.toFixed(2)} />
         <LineChart title="impact_bps @ notional=100 (buy/sell)" series={impactSeries} valueFormatter={(v) => v.toFixed(2)} />
       </div>
+
+      <details className="rounded-lg border border-zinc-800 bg-zinc-950/40 p-4">
+        <summary className="cursor-pointer text-sm font-semibold text-zinc-200">
+          指标解释 / Metric glossary
+        </summary>
+        <div className="mt-3 grid grid-cols-1 gap-2 text-sm text-zinc-300 md:grid-cols-2">
+          <div>
+            <div className="font-semibold">mid</div>
+            <div className="text-xs text-zinc-400">{HELP.mid}</div>
+          </div>
+          <div>
+            <div className="font-semibold">spread_bps</div>
+            <div className="text-xs text-zinc-400">{HELP.spread_bps}</div>
+          </div>
+          <div>
+            <div className="font-semibold">impact_bps@100</div>
+            <div className="text-xs text-zinc-400">{HELP.impact}</div>
+          </div>
+          <div>
+            <div className="font-semibold">two_sided</div>
+            <div className="text-xs text-zinc-400">{HELP.two_sided}</div>
+          </div>
+        </div>
+      </details>
 
       <details className="rounded-lg border border-zinc-800 bg-zinc-950/40 p-4">
         <summary className="cursor-pointer text-sm font-semibold text-zinc-200">

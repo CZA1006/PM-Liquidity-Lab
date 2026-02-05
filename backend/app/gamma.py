@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 import httpx
+from .config import settings
 
 class GammaClient:
     def __init__(self, base: str, timeout: float = 10.0):
@@ -79,6 +80,33 @@ class GammaClient:
             r.raise_for_status()
             return r.json()
 
+    async def list_events(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        active: Optional[bool] = None,
+        closed: Optional[bool] = None,
+        archived: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """
+        GET /events (Gamma).
+        Used for active market enumeration.
+        """
+        url = f"{self.base}/events"
+        params: Dict[str, Any] = {"limit": int(limit), "offset": int(offset)}
+        if active is not None:
+            params["active"] = "true" if active else "false"
+        if closed is not None:
+            params["closed"] = "true" if closed else "false"
+        if archived is not None:
+            params["archived"] = "true" if archived else "false"
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.get(url, params=params)
+            r.raise_for_status()
+            return r.json()
+
     async def get_market_by_slug(
         self, slug: str, max_pages: int = 20, page_size: int = 200
     ) -> Optional[Dict[str, Any]]:
@@ -125,3 +153,57 @@ def pick_tokens_from_markets(markets: List[Dict[str, Any]], keyword: str, pick_n
                 if len(token_ids) >= pick_n:
                     return token_ids
     return token_ids
+
+
+async def list_markets(
+    *,
+    limit: int = 100,
+    offset: int = 0,
+    active_only: bool = True,
+) -> Dict[str, Any]:
+    """
+    Enumerate markets from Gamma.
+    Best-effort active filtering (Gamma fields vary over time).
+    """
+    gamma = GammaClient(settings.GAMMA_HTTP_BASE)
+    data = await gamma.list_markets(limit=limit, offset=offset)
+
+    markets = data if isinstance(data, list) else data.get("markets") or data.get("data") or []
+
+    if not active_only:
+        return {"markets": markets, "raw": data}
+
+    def is_active(m: Dict[str, Any]) -> bool:
+        if isinstance(m.get("active"), bool) and m.get("active") is False:
+            return False
+        if isinstance(m.get("closed"), bool) and m.get("closed") is True:
+            return False
+        if isinstance(m.get("archived"), bool) and m.get("archived") is True:
+            return False
+        st = str(m.get("status") or "").lower()
+        if st in ("resolved", "closed", "ended", "archived", "settled"):
+            return False
+        if st in ("active", "trading", "open"):
+            return True
+        return True
+
+    filtered = [m for m in markets if isinstance(m, dict) and is_active(m)]
+    return {"markets": filtered, "raw": data}
+
+
+async def list_events(
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    active: Optional[bool] = None,
+    closed: Optional[bool] = None,
+    archived: Optional[bool] = None,
+) -> Dict[str, Any]:
+    gamma = GammaClient(settings.GAMMA_HTTP_BASE)
+    return await gamma.list_events(
+        limit=limit,
+        offset=offset,
+        active=active,
+        closed=closed,
+        archived=archived,
+    )
