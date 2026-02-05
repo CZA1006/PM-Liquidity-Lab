@@ -1,10 +1,26 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import asyncio
 import json
 import os
 import time
 from typing import Any, Dict, List, Optional
+
+# ---------------------------------------------------------------------------
+# Load backend/.env into process env so monitor.py os.getenv("CALIB_*") works.
+# - Keep override=False so shell exports win.
+# - Must happen before any os.getenv(...) usage in this module.
+# ---------------------------------------------------------------------------
+try:
+    from dotenv import load_dotenv  # type: ignore
+
+    _env_path = Path(__file__).resolve().parents[1] / ".env"
+    if _env_path.exists():
+        load_dotenv(dotenv_path=_env_path, override=False)
+except Exception:
+    pass
 
 from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware

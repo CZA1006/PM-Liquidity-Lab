@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
 from . import schemas
@@ -12,6 +13,7 @@ from .gamma import GammaClient, pick_tokens_from_markets
 from .normalize import extract_exchange_ts_ms, normalize_book
 from .storage import JsonlEventWriter, default_eventlog_path, default_run_dir, ensure_dir, safe_write
 from .raw_log import RawLogWriter
+from .calibrator import CompareResult, should_rebase
 from .ws_client import MarketWsClient
 
 
@@ -53,6 +55,13 @@ def _normalize_token_ids(ids_raw: Any) -> List[str]:
     return [str(ids_raw)]
 
 
+# ---- calibration env ----
+CALIB_TOPN = int(os.getenv("CALIB_TOPN", "50"))
+CALIB_MISMATCH_LEVELS = int(os.getenv("CALIB_MISMATCH_LEVELS", "4"))
+CALIB_MISMATCH_NOTIONAL = float(os.getenv("CALIB_MISMATCH_NOTIONAL", "50.0"))
+CALIB_TOB_MUST_MATCH = os.getenv("CALIB_TOB_MUST_MATCH", "1") not in ("0", "false", "False")
+
+
 @dataclass
 class MonitorStatus:
     run_id: str
@@ -68,6 +77,16 @@ class MonitorStatus:
     raw_log_path: str = ""
     raw_events_written: int = 0
     raw_log_dir: str = ""
+    compare_total: int = 0
+    compare_tob_match: int = 0
+    compare_mismatch_notional_samples: List[float] = field(default_factory=list)
+    last_compare: Optional[Dict[str, Any]] = None
+    last_rest_snapshot_ts_ms: Optional[int] = None
+    # ---- effective config (debug / acceptance) ----
+    effective_rest_poll_sec: float = 0.0
+    effective_calibration_interval_sec: int = 0
+    effective_calibration_top_n: int = 0
+    effective_monitor_mismatch_levels: int = 0
 
 
 class MetricsHub:
@@ -143,6 +162,16 @@ class Monitor:
         self.rest_polls: int = 0
         self.rebase_count: int = 0
         self.last_trade_price: Dict[str, float] = {}
+        self.compare_total: int = 0
+        self.compare_tob_match: int = 0
+        self.compare_mismatch_notional_samples: List[float] = []
+        self.last_compare: Optional[Dict[str, Any]] = None
+        self.last_rest_snapshot_ts_ms: Optional[int] = None
+        # effective config snapshots (for /monitor/status observability)
+        self._effective_rest_poll_sec: float = float(self.settings.CALIBRATION_INTERVAL_SEC)
+        self._effective_calibration_interval_sec: int = int(self.settings.CALIBRATION_INTERVAL_SEC)
+        self._effective_calibration_top_n: int = int(self.settings.CALIBRATION_TOP_N)
+        self._effective_monitor_mismatch_levels: int = int(self.settings.MONITOR_MISMATCH_LEVELS)
 
     def _write_event(self, *, event: str, schema: str, **fields: Any) -> None:
         safe_write(
@@ -221,6 +250,15 @@ class Monitor:
             raw_log_path=self.raw.status.file_path,
             raw_events_written=self.raw.status.written,
             raw_log_dir=self.raw.status.dir_path,
+            compare_total=self.compare_total,
+            compare_tob_match=self.compare_tob_match,
+            compare_mismatch_notional_samples=self.compare_mismatch_notional_samples,
+            last_compare=self.last_compare,
+            last_rest_snapshot_ts_ms=self.last_rest_snapshot_ts_ms,
+            effective_rest_poll_sec=self._effective_rest_poll_sec,
+            effective_calibration_interval_sec=self._effective_calibration_interval_sec,
+            effective_calibration_top_n=self._effective_calibration_top_n,
+            effective_monitor_mismatch_levels=self._effective_monitor_mismatch_levels,
         )
 
     def _empty_metrics_tick(self, token_id: str) -> Dict[str, Any]:
@@ -372,6 +410,13 @@ class Monitor:
             notional_list=list(self.settings.LIQ_NOTIONALS),
             depth_bps_list=list(self.settings.LIQ_DEPTH_BPS_LIST),
         )
+        metrics["health"] = {
+            "ws_connected": bool(self.ws_connected),
+            "ws_lag_ms": None,
+            "last_rest_snapshot_ts_ms": self.last_rest_snapshot_ts_ms,
+            "last_compare": self.last_compare,
+            "rebase_count": self.rebase_count,
+        }
         ts_ms = _now_ms()
         exch_ts = extract_exchange_ts_ms(snap)
 
@@ -443,6 +488,63 @@ class Monitor:
             "asks": asks,
             "exchange_ts_ms": st.exchange_ts_ms,
         }
+
+    def _compare_topn(self, token_id: str, book: BookState, snap: Dict[str, Any], topn: int) -> CompareResult:
+        def _sorted_levels(levels: List[List[float]], side: str) -> List[List[float]]:
+            if side == "bids":
+                return sorted(levels, key=lambda x: x[0], reverse=True)
+            return sorted(levels, key=lambda x: x[0])
+
+        best_bid = book.best_bid()
+        best_ask = book.best_ask()
+        snap_bids = _sorted_levels(snap.get("bids") or [], "bids")
+        snap_asks = _sorted_levels(snap.get("asks") or [], "asks")
+        snap_best_bid = snap_bids[0][0] if snap_bids else None
+        snap_best_ask = snap_asks[0][0] if snap_asks else None
+        tob_match = (best_bid[0] if best_bid else None) == snap_best_bid and (best_ask[0] if best_ask else None) == snap_best_ask
+
+        def to_map(levels: List[List[float]], n: int) -> Dict[float, float]:
+            m: Dict[float, float] = {}
+            for lv in levels[:n]:
+                try:
+                    p = float(lv[0])
+                    s = float(lv[1])
+                except Exception:
+                    continue
+                m[p] = s
+            return m
+
+        b_map = dict(book.levels("bid", topn))
+        a_map = dict(book.levels("ask", topn))
+        sb = to_map(snap_bids, topn)
+        sa = to_map(snap_asks, topn)
+
+        prices = set(b_map.keys()) | set(a_map.keys()) | set(sb.keys()) | set(sa.keys())
+        mismatch_levels = 0
+        mismatch_notional = 0.0
+        for p in prices:
+            bsz = b_map.get(p, 0.0)
+            sbsz = sb.get(p, 0.0)
+            asz = a_map.get(p, 0.0)
+            sasz = sa.get(p, 0.0)
+            if bsz != sbsz:
+                mismatch_levels += 1
+                mismatch_notional += abs(bsz - sbsz) * p
+            if asz != sasz:
+                mismatch_levels += 1
+                mismatch_notional += abs(asz - sasz) * p
+
+        return CompareResult(
+            token_id=token_id,
+            compared_topn=topn,
+            tob_match=tob_match,
+            mismatch_levels=mismatch_levels,
+            mismatch_notional=float(mismatch_notional),
+            best_bid=best_bid[0] if best_bid else None,
+            best_ask=best_ask[0] if best_ask else None,
+            snap_best_bid=snap_best_bid,
+            snap_best_ask=snap_best_ask,
+        )
 
     async def _ws_loop(self) -> None:
         ws = MarketWsClient(self.settings.CLOB_WS_BASE, channel=self.settings.CLOB_WS_CHANNEL)
@@ -522,9 +624,31 @@ class Monitor:
             )
 
     async def _rest_poll_loop(self) -> None:
-        poll_sec = float(self.settings.MONITOR_POLL_INTERVAL_SEC)
+        # ---- threshold snapshot (for raw events / acceptance) ----
+        # NOTE: do not change decision logic; only record the effective thresholds used.
+        def _thresh_snapshot(top_n: int, mismatch_levels: int) -> Dict[str, Any]:
+            try:
+                mismatch_notional = float(os.getenv("CALIB_MISMATCH_NOTIONAL", "50.0"))
+            except Exception:
+                mismatch_notional = 50.0
+            tob_must_match = os.getenv("CALIB_TOB_MUST_MATCH", "1") not in ("0", "false", "False")
+            return {
+                "thresh_top_n": int(top_n),
+                "thresh_mismatch_levels": int(mismatch_levels),
+                "thresh_mismatch_notional": float(mismatch_notional),
+                "thresh_tob_must_match": bool(tob_must_match),
+                "thresh_source": "mixed",
+            }
+
+        # Single source of truth for REST snapshot polling interval:
+        # use CALIBRATION_INTERVAL_SEC (avoid MONITOR_POLL_INTERVAL_SEC affecting /books drift correction).
+        poll_sec = float(self.settings.CALIBRATION_INTERVAL_SEC)
         mismatch_threshold = int(self.settings.MONITOR_MISMATCH_LEVELS)
         top_n = int(self.settings.CALIBRATION_TOP_N)
+        self._effective_rest_poll_sec = poll_sec
+        self._effective_calibration_interval_sec = int(self.settings.CALIBRATION_INTERVAL_SEC)
+        self._effective_calibration_top_n = top_n
+        self._effective_monitor_mismatch_levels = mismatch_threshold
 
         while not self._stop_evt.is_set():
             try:
@@ -547,24 +671,43 @@ class Monitor:
                         tid = nb.get("token_id") or ""
                         if not tid or tid not in self.book_states:
                             continue
-                        snap_state = BookState(token_id=tid)
-                        snap_state.apply_snapshot(
-                            nb.get("bids") or [],
-                            nb.get("asks") or [],
-                            exchange_ts_ms=nb.get("exchange_ts_ms"),
-                        )
+                        self.last_rest_snapshot_ts_ms = _now_ms()
                         cur = self.book_states[tid]
-                        mismatch_levels = compare_top_n(cur, snap_state, top_n)
-                        self._raw_write(
-                            "rest_snapshot",
-                            {
-                                "token_id": tid,
-                                "mismatch_levels": mismatch_levels,
-                                "snapshot_keys": list(raw.keys()),
-                            },
-                            token_id=tid,
+                        # Compare using the same Top-N as the calibration settings
+                        # (avoid env CALIB_TOPN drifting from Settings/CALIBRATION_TOP_N)
+                        cmp = self._compare_topn(tid, cur, nb, top_n)
+                        self.compare_total += 1
+                        if cmp.tob_match:
+                            self.compare_tob_match += 1
+                        self.compare_mismatch_notional_samples.append(cmp.mismatch_notional)
+                        self.last_compare = cmp.as_dict()
+                        if self.raw:
+                            self.raw.write_event(
+                                run_id=self.run_id,
+                                token_id=tid,
+                                event="calibration_compare",
+                                payload={
+                                    "compare": cmp.as_dict(),
+                                    "thresholds": _thresh_snapshot(top_n, mismatch_threshold),
+                                },
+                                ts_ms=self.last_rest_snapshot_ts_ms,
+                            )
+
+                        # Rebase decision must use the same effective thresholds we report.
+                        # - Top-N: Settings.CALIBRATION_TOP_N
+                        # - mismatch levels: Settings.MONITOR_MISMATCH_LEVELS
+                        # - notional / tob: env CALIB_* (legacy overrides)
+                        do_rebase = should_rebase(
+                            cmp,
+                            tob_must_match=CALIB_TOB_MUST_MATCH,
+                            mismatch_levels_th=mismatch_threshold,
+                            mismatch_notional_th=CALIB_MISMATCH_NOTIONAL,
                         )
-                        if mismatch_levels >= mismatch_threshold:
+                        if do_rebase:
+                            before = {
+                                "best_bid": cur.best_bid(),
+                                "best_ask": cur.best_ask(),
+                            }
                             self.book_states[tid].apply_snapshot(
                                 nb.get("bids") or [],
                                 nb.get("asks") or [],
@@ -572,23 +715,42 @@ class Monitor:
                                 source="rest_rebase",
                                 exchange_ts_ms=nb.get("exchange_ts_ms"),
                             )
+                            after = {
+                                "best_bid": cur.best_bid(),
+                                "best_ask": cur.best_ask(),
+                            }
                             self.rebase_count += 1
-                            self._raw_write(
-                                "rebase",
-                                {
-                                    "token_id": tid,
-                                    "mismatch_levels": mismatch_levels,
-                                    "threshold": mismatch_threshold,
-                                },
-                                token_id=tid,
-                            )
+                            if self.raw:
+                                self.raw.write_event(
+                                    run_id=self.run_id,
+                                    token_id=tid,
+                                    event="rebase",
+                                    payload={
+                                        "reason": "threshold_exceeded",
+                                        # Keep the threshold snapshot consistent with calibration_compare.
+                                        "thresholds": _thresh_snapshot(top_n, mismatch_threshold),
+                                        "compare": cmp.as_dict(),
+                                        "before": before,
+                                        "after": after,
+                                    },
+                                    ts_ms=self.last_rest_snapshot_ts_ms,
+                                )
                             self._write_event(
                                 event="rebase",
                                 schema="rebase_v1",
                                 token_id=tid,
-                                reason={"mismatch_levels": mismatch_levels},
+                                reason={"mismatch_levels": cmp.mismatch_levels},
                             )
                             await self._publish_metrics_from_snapshot(nb, source="rest", reason="rebase")
+                        else:
+                            self.book_states[tid].apply_snapshot(
+                                nb.get("bids") or [],
+                                nb.get("asks") or [],
+                                ts_ms=_now_ms(),
+                                source="rest",
+                                exchange_ts_ms=nb.get("exchange_ts_ms"),
+                            )
+                            await self._publish_metrics_from_snapshot(nb, source="rest", reason="rest_book")
             except asyncio.CancelledError:
                 break
             except Exception as e:

@@ -44,6 +44,28 @@ class RawLogWriter:
         self._writer.write(rec)
         self.status.written += 1
 
+    def write_event(
+        self,
+        *,
+        run_id: str,
+        token_id: Optional[str],
+        event: str,
+        payload: Dict[str, Any],
+        ts_ms: Optional[int] = None,
+    ) -> None:
+        if ts_ms is None:
+            ts_ms = int(time.time() * 1000)
+        self._writer.write(
+            {
+                "ts_ms": ts_ms,
+                "run_id": run_id,
+                "token_id": token_id,
+                "event": event,
+                "payload": payload,
+            }
+        )
+        self.status.written += 1
+
     def close(self) -> None:
         try:
             self._writer.close()

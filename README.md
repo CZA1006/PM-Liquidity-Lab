@@ -7,12 +7,14 @@ This repo is a full-stack local app:
 - **Frontend (Next.js App Router)**: market search → market detail, **YES/NO** cards, realtime charts (lightweight-charts **v5**).
 
 > Current status: local prototype is functional: market detail + realtime charts (mid / spread_bps / impact_bps).  
+> Current focus: **monitor calibration + raw event logging** for acceptance and debugging.  
 > Next milestone: watchlist dashboard + improved UX + definitions panel + persistence (ClickHouse/Postgres).
 
 ---
 
 ## Contents
 - [Features](#features)
+- [Calibration + Raw Event Logs](#calibration--raw-event-logs)
 - [Screenshots / UI](#screenshots--ui)
 - [Repo Structure](#repo-structure)
 - [Quickstart](#quickstart)
@@ -22,6 +24,7 @@ This repo is a full-stack local app:
 - [Liquidity Metrics](#liquidity-metrics)
 - [Frontend Charts](#frontend-charts)
 - [Development Workflow](#development-workflow)
+- [Acceptance / Load Test](#acceptance--load-test)
 - [Troubleshooting](#troubleshooting)
 - [Roadmap](#roadmap)
 - [License](#license)
@@ -47,6 +50,8 @@ From a market detail page, you can configure backend to monitor that market’s 
   2) **spread_bps (YES/NO)**
   3) **impact_bps @ notional=100 (buy/sell)**
 
+> Note: backend also writes **raw events JSONL** (monitor status provides `raw_log_path`) for auditing/acceptance.
+
 ---
 
 ## Screenshots / UI
@@ -59,6 +64,68 @@ Market detail page typically shows:
 
 ---
 
+## Calibration + Raw Event Logs
+
+Backend monitor includes a periodic **calibration** step that compares:
+- **WS snapshot-derived best bid/ask**
+vs
+- **REST best bid/ask (top-N)** (best-effort)
+
+It writes structured raw events to disk (JSONL) for offline inspection and acceptance checks.
+
+### Raw log location
+
+By default the backend writes under:
+- `backend/data/raw/local/events-<ts>.jsonl`
+
+`GET /monitor/status` returns a `raw_log_path` (often `./data/raw/local/events-<ts>.jsonl`), and the load test script maps it to `backend/...` for local file checks.
+
+### Raw event schemas (high level)
+
+Two key events:
+
+1) `calibration_compare`
+```json
+{
+  "event": "calibration_compare",
+  "payload": {
+    "compare": { "tob_match": true, "mismatch_levels": 0, "mismatch_notional": 0.0, "...": "..." },
+    "thresholds": {
+      "thresh_top_n": 50,
+      "thresh_mismatch_levels": 50,
+      "thresh_mismatch_notional": 200.0,
+      "thresh_tob_must_match": true,
+      "thresh_source": "mixed"
+    }
+  }
+}
+```
+
+2) `rebase`
+```json
+{
+  "event": "rebase",
+  "payload": { "thresholds": { "...same fields as above..." }, "...": "..." }
+}
+```
+
+### Threshold sources (two layers)
+
+There are **two configuration layers**:
+
+1) `CALIBRATION_*` (Settings / `.env`) — calibration **interval + top-N defaults**
+   - `CALIBRATION_INTERVAL_SEC` (default `30`)
+   - `CALIBRATION_TOP_N` (default `50`)
+
+2) `CALIB_*` (environment variables read inside `monitor.py`) — acceptance **thresholds**
+   - `CALIB_TOPN` (default `50`)
+   - `CALIB_MISMATCH_LEVELS` (default `4` unless overridden)
+   - `CALIB_MISMATCH_NOTIONAL` (default `50.0` unless overridden)
+   - `CALIB_TOB_MUST_MATCH` (default `1` / true)
+
+Recommended: keep `CALIBRATION_*` for cadence and sampling, and tune `CALIB_*` for acceptance thresholds.
+
+---
 ## Repo structure
 
 ```
@@ -122,6 +189,33 @@ source .venv/bin/activate  # macOS/Linux
 pip install -r requirements.txt
 
 uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+#### Backend environment
+
+backend/.env example:
+```
+# ---- CLOB ----
+CLOB_HTTP_BASE=https://clob.polymarket.com
+CLOB_WS_BASE=wss://ws-subscriptions-clob.polymarket.com/ws
+CLOB_WS_CHANNEL=market
+
+# ---- Gamma ----
+GAMMA_HTTP_BASE=https://gamma-api.polymarket.com
+
+# ---- Calibration cadence (Settings/.env) ----
+CALIBRATION_INTERVAL_SEC=30
+CALIBRATION_TOP_N=50
+
+# ---- Calibration thresholds (monitor.py CALIB_*) ----
+CALIB_TOPN=50
+CALIB_MISMATCH_LEVELS=50
+CALIB_MISMATCH_NOTIONAL=200
+CALIB_TOB_MUST_MATCH=1
+
+# ---- Logging / storage ----
+DATA_DIR=./data
+RUN_ID=local
 ```
 
 Health check:
@@ -297,6 +391,27 @@ npm run dev
 
 ---
 
+## Acceptance / Load Test
+
+We provide a local load test script that:
+- picks a set of active markets → extracts token IDs
+- calls POST /monitor/set_tokens
+- runs for N seconds while polling /monitor/status and /metrics/current
+- validates raw-log acceptance criteria (threshold snapshots + consistency)
+- prints calibration quality stats (TOB match rate, mismatch notional p90)
+
+### Run
+```bash
+python backend/scripts/load_test_2h.py --api http://127.0.0.1:8000 --markets 20 --duration 120 --max_tokens 60
+```
+
+### Pass/Fail signals
+- ws_connected=True in [final status]
+- [raw log size] backend/data/raw/local/events-*.jsonl ... (file exists)
+- [accept] thresholds: OK (rebase thresholds consistent)
+- [calibration stats] compares > 0 (unless run too short / no calibration tick)
+
+---
 ## Troubleshooting
 
 ### 1) `Module not found: Can't resolve '@/components/...'`
@@ -324,6 +439,22 @@ Fix:
 - Check backend logs: monitor WS ping/reconnect loops
 - Ensure backend sends heartbeat periodically
 - Confirm browser Network tab shows the SSE request as “pending/streaming”
+
+### 5) Load test says FAIL (no calibration_compare.payload.thresholds found) but you can see thresholds in the JSONL
+This usually means the script is reading the wrong file path (relative raw_log_path vs actual repo path).
+Expected behavior:
+- /monitor/status returns something like ./data/raw/local/events-....jsonl
+- actual file is at backend/data/raw/local/events-....jsonl
+
+Fix:
+- Ensure DATA_DIR=./data and backend working directory is backend/ when starting uvicorn
+- Or rely on the load test path mapping (./data/... → backend/data/...) and keep repo layout intact
+
+### 6) CALIB_* env vars not taking effect
+If you edited backend/.env but thresholds stay unchanged:
+- confirm your backend actually loads .env (Settings loader) and that monitor.py reads from process env
+- restart backend process after changes
+- print /monitor/status fields like effective_* to confirm what backend thinks is active
 
 ---
 

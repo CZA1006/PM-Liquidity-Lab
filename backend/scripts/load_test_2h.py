@@ -1,14 +1,28 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import glob
 import argparse
 import json
 import os
 import random
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from _http import http_get_json, http_post_json
+
+
+def percentile(vals, pct: float):
+    if not vals:
+        return None
+    xs = sorted(vals)
+    k = (len(xs) - 1) * (pct / 100.0)
+    f = int(k)
+    c = min(f + 1, len(xs) - 1)
+    if c == f:
+        return float(xs[f])
+    return float(xs[f] + (xs[c] - xs[f]) * (k - f))
 
 
 def parse_clob_token_ids(m: Dict[str, Any]) -> List[str]:
@@ -120,6 +134,85 @@ def sizeof_file(path: str) -> Optional[int]:
         return None
 
 
+def _first_thresholds(raw_path: str, event: str) -> Optional[Dict[str, Any]]:
+    """
+    Return the first thresholds snapshot from raw log for a given event.
+    Expected schema (compat):
+      - {"event": "...", "payload": {"thresholds": {...}}}
+      - {"event": "...", "payload": {"payload": {"thresholds": {...}}}}
+      - {"event": "...", "thresholds": {...}}
+    """
+    if not raw_path:
+        return None
+    # raw_log_path often comes back as "./data/..." from backend, but the actual file
+    # is at "backend/data/..." when running this script from repo root.
+    p = Path(raw_path)
+    if not p.is_absolute():
+        cand = None
+        if isinstance(raw_path, str) and raw_path.startswith("./data/"):
+            cand = Path("backend") / raw_path[2:]
+        else:
+            cand = p
+        if not cand.exists():
+            cand2 = Path("backend") / p
+            if cand2.exists():
+                cand = cand2
+        p = cand
+    if not p or not p.exists():
+        return None
+    with open(p, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if o.get("event") != event:
+                continue
+            # Prefer payload.thresholds (new format), but be defensive:
+            # sometimes payload can be nested or thresholds might be at top-level.
+            payload = o.get("payload") or {}
+            candidates = []
+            # 1) payload.thresholds
+            candidates.append(payload.get("thresholds"))
+            # 2) payload.payload.thresholds (rare nested payload)
+            if isinstance(payload.get("payload"), dict):
+                candidates.append(payload.get("payload", {}).get("thresholds"))
+            # 3) top-level thresholds
+            candidates.append(o.get("thresholds"))
+
+            th = None
+            for c in candidates:
+                if isinstance(c, dict) and c:
+                    th = c
+                    break
+            if th is not None:
+                return th
+    return None
+
+
+def _assert_rebase_thresholds_consistent(raw_path: str) -> None:
+    """
+    Acceptance check:
+      - calibration_compare must have payload.thresholds
+      - if rebase exists, its payload.thresholds must match core fields
+    """
+    cal = _first_thresholds(raw_path, "calibration_compare")
+    if not cal:
+        print("[accept] thresholds: FAIL (no calibration_compare.payload.thresholds found)")
+        return
+    reb = _first_thresholds(raw_path, "rebase")
+    if not reb:
+        print("[accept] thresholds: OK (no rebase event; calibration thresholds present)")
+        return
+    keys = ["thresh_top_n", "thresh_mismatch_levels", "thresh_mismatch_notional", "thresh_tob_must_match"]
+    mismatch = {k: (cal.get(k), reb.get(k)) for k in keys if cal.get(k) != reb.get(k)}
+    if mismatch:
+        print("[accept] thresholds: FAIL (rebase thresholds != calibration thresholds)")
+        print("         diff:", mismatch)
+    else:
+        print("[accept] thresholds: OK (rebase thresholds consistent)")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--api", required=True, help="e.g. http://127.0.0.1:8000")
@@ -183,11 +276,70 @@ def main() -> None:
             print("  -", k, "=", last_status.get(k))
 
     if last_raw_path:
-        sz = sizeof_file(last_raw_path)
+        size_path = last_raw_path
+        if isinstance(size_path, str) and size_path.startswith("./data/"):
+            size_path = "backend/" + size_path[2:]
+        sz = sizeof_file(size_path)
         if sz is not None:
-            print(f"[raw log size] {last_raw_path} bytes={sz} (~{sz/1024/1024:.2f} MB)")
+            print(f"[raw log size] {size_path} bytes={sz} (~{sz/1024/1024:.2f} MB)")
         else:
-            print(f"[raw log size] {last_raw_path} (not found)")
+            print(f"[raw log size] {size_path} (not found)")
+
+    if last_raw_path:
+        _assert_rebase_thresholds_consistent(last_raw_path)
+
+    # ---- compute compare stats from raw log (best-effort) ----
+    raw_path = last_status.get("raw_log_path") if last_status else None
+    p: Optional[Path] = Path(raw_path) if raw_path else None
+    if p and not p.is_absolute():
+        cand1 = (Path.cwd() / p).resolve()
+        cand2 = (Path.cwd() / "backend" / p).resolve()
+        parts = p.parts
+        cand3 = None
+        if len(parts) >= 2 and parts[0] == "." and parts[1] == "data":
+            cand3 = (Path.cwd() / "backend" / Path(*parts[1:])).resolve()
+        for cand in (cand1, cand2, cand3):
+            if cand and cand.exists():
+                p = cand
+                break
+
+    if p and p.exists():
+        tob = []
+        mismatch_notional = []
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("event") != "calibration_compare":
+                    continue
+                payload = obj.get("payload") or {}
+                # schema compatibility:
+                # - old: payload has tob_match / mismatch_notional at top-level
+                # - new: payload has {"compare": {...}, "thresholds": {...}}
+                cmp = payload.get("compare")
+                if not isinstance(cmp, dict):
+                    cmp = payload
+
+                if "tob_match" in cmp:
+                    tob.append(bool(cmp["tob_match"]))
+                if "mismatch_notional" in cmp:
+                    try:
+                        mismatch_notional.append(float(cmp["mismatch_notional"]))
+                    except Exception:
+                        pass
+        if tob:
+            tob_match_rate = sum(1 for x in tob if x) / len(tob)
+        else:
+            tob_match_rate = None
+        p90 = percentile(mismatch_notional, 90.0)
+        print("[calibration stats]")
+        print("  - compares =", len(tob))
+        print("  - tob_match_rate =", tob_match_rate)
+        print("  - mismatch_notional_p90 =", p90)
+    else:
+        print(f"[calibration stats] raw_log_path missing or not found; skipping (raw_log_path={raw_path})")
 
 
 if __name__ == "__main__":

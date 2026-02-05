@@ -208,6 +208,19 @@ export default function MarketView({ slug }: { slug: string }) {
 
   const yesToken = tokens[0] ?? null;
   const noToken = tokens[1] ?? null;
+  const latest =
+    (yesToken && tickByToken[yesToken]) ||
+    (noToken && tickByToken[noToken]) ||
+    null;
+
+  const health = latest?.metrics?.health ?? null;
+  const lastCompare = health?.last_compare ?? null;
+  const wsConnected = typeof health?.ws_connected === "boolean" ? health.ws_connected : null;
+  const rebaseCount = typeof health?.rebase_count === "number" ? health.rebase_count : null;
+  const lastRestTs =
+    typeof health?.last_rest_snapshot_ts_ms === "number"
+      ? health.last_rest_snapshot_ts_ms
+      : null;
 
   function sideCard(label: string, tokenId: string | null) {
     if (!tokenId) {
@@ -382,6 +395,43 @@ export default function MarketView({ slug }: { slug: string }) {
             monitor: started={String(status?.started)} ws={String(status?.ws_connected)} token_n=
             {status?.token_ids?.length ?? tokens.length}
           </div>
+        </div>
+      </div>
+
+      <div className="rounded-lg border border-zinc-800 bg-zinc-950/40 p-4">
+        <div className="mb-2 text-sm font-semibold">Health / Calibration</div>
+        <div className="grid grid-cols-1 gap-x-6 gap-y-1 text-sm md:grid-cols-2">
+          <div>
+            WS connected: <span className="font-mono">{wsConnected === null ? "-" : String(wsConnected)}</span>
+          </div>
+          <div>
+            Rebase count: <span className="font-mono">{rebaseCount === null ? "-" : rebaseCount}</span>
+          </div>
+          <div>
+            Last REST snapshot: <span className="font-mono">{fmtTs(lastRestTs)}</span>
+          </div>
+          <div>
+            WS lag ms: <span className="font-mono">{health?.ws_lag_ms ?? "-"}</span>
+          </div>
+          <div className="mt-2 font-semibold md:col-span-2">Last compare</div>
+          <div>
+            TopN: <span className="font-mono">{lastCompare?.compared_topn ?? "-"}</span>
+          </div>
+          <div>
+            TOB match:{" "}
+            <span className="font-mono">
+              {lastCompare?.tob_match === undefined ? "-" : String(lastCompare?.tob_match)}
+            </span>
+          </div>
+          <div>
+            Mismatch levels: <span className="font-mono">{lastCompare?.mismatch_levels ?? "-"}</span>
+          </div>
+          <div>
+            Mismatch notional: <span className="font-mono">{lastCompare?.mismatch_notional ?? "-"}</span>
+          </div>
+        </div>
+        <div className="mt-2 text-xs text-zinc-500">
+          Source: backend metrics_tick.metrics.health (populated on REST calibration cycles).
         </div>
       </div>
 

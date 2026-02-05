@@ -3,13 +3,55 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Dict, List
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Any
 
 from .book_engine import BookState, compare_top_n
 from .normalize import normalize_book
 from .clob_rest import ClobRestClient
 
 log = logging.getLogger("calibrator")
+
+@dataclass
+class CompareResult:
+    token_id: str
+    compared_topn: int
+    tob_match: bool
+    mismatch_levels: int
+    mismatch_notional: float
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
+    snap_best_bid: Optional[float] = None
+    snap_best_ask: Optional[float] = None
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "token_id": self.token_id,
+            "compared_topn": self.compared_topn,
+            "tob_match": self.tob_match,
+            "mismatch_levels": self.mismatch_levels,
+            "mismatch_notional": self.mismatch_notional,
+            "best_bid": self.best_bid,
+            "best_ask": self.best_ask,
+            "snap_best_bid": self.snap_best_bid,
+            "snap_best_ask": self.snap_best_ask,
+        }
+
+
+def should_rebase(
+    cmp: CompareResult,
+    *,
+    tob_must_match: bool = True,
+    mismatch_levels_th: int = 4,
+    mismatch_notional_th: float = 50.0,
+) -> bool:
+    if tob_must_match and (not cmp.tob_match):
+        return True
+    if cmp.mismatch_levels >= mismatch_levels_th:
+        return True
+    if cmp.mismatch_notional >= mismatch_notional_th:
+        return True
+    return False
 
 class Calibrator:
     def __init__(self, rest: ClobRestClient, interval_sec: int, top_n: int):
