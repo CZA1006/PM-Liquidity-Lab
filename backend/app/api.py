@@ -376,12 +376,19 @@ async def gamma_market(slug: str) -> JSONResponse:
 
 
 @app.get("/gamma/active_markets")
-async def gamma_active_markets(limit: int = 100, offset: int = 0) -> JSONResponse:
+async def gamma_active_markets(
+    limit: int = 100,
+    offset: int = 0,
+    active_only: bool = True,
+) -> JSONResponse:
     """
     Enumerate ACTIVE markets (event-based; best-effort).
     Response shape: { markets: [...], events_n: n, markets_n: m, limit, offset }
     """
-    data = await gamma_list_events(limit=limit, offset=offset, active=True, closed=False)
+    if active_only:
+        data = await gamma_list_events(limit=limit, offset=offset, active=True, closed=False)
+    else:
+        data = await gamma_list_events(limit=limit, offset=offset, active=None, closed=None, archived=None)
 
     events = data if isinstance(data, list) else data.get("events") or data.get("data") or []
     out_markets: List[Dict[str, Any]] = []
@@ -391,6 +398,8 @@ async def gamma_active_markets(limit: int = 100, offset: int = 0) -> JSONRespons
         ev_id = ev.get("id")
         ev_title = ev.get("title") or ev.get("name")
         ev_slug = ev.get("slug")
+        ev_category = ev.get("category")
+        ev_tags = ev.get("tags")
         ev_start = ev.get("startDate") or ev.get("start_date")
         ev_end = ev.get("endDate") or ev.get("end_date")
         ev_closed = ev.get("closed")
@@ -408,6 +417,8 @@ async def gamma_active_markets(limit: int = 100, offset: int = 0) -> JSONRespons
             mm["event_id"] = ev_id
             mm["event_title"] = ev_title
             mm["event_slug"] = ev_slug
+            mm["event_category"] = ev_category
+            mm["event_tags"] = ev_tags
             mm["event_start"] = ev_start
             mm["event_end"] = ev_end
             mm["event_active"] = ev_active
@@ -419,6 +430,7 @@ async def gamma_active_markets(limit: int = 100, offset: int = 0) -> JSONRespons
         content={
             "limit": limit,
             "offset": offset,
+            "active_only": active_only,
             "events_n": len(events),
             "markets": out_markets,
             "markets_n": len(out_markets),

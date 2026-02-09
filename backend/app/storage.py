@@ -4,6 +4,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Iterable, List
 
 import orjson
+try:
+    import zstandard as zstd  # type: ignore
+except Exception:  # pragma: no cover
+    zstd = None  # type: ignore
 
 class JsonlWriter:
     """
@@ -23,6 +27,71 @@ class JsonlWriter:
 
     def close(self) -> None:
         return
+
+
+class JsonlZstWriter:
+    """Best-effort .jsonl.zst streaming writer.
+
+    If zstandard is unavailable or initialization fails, this writer becomes no-op.
+    """
+
+    def __init__(self, path: str, level: int = 3) -> None:
+        self.path = path
+        self._enabled = False
+        self._fp = None
+        self._zw = None
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            if zstd is None:
+                return
+            self._fp = open(self.path, "ab", buffering=0)
+            cctx = zstd.ZstdCompressor(level=level)
+            self._zw = cctx.stream_writer(self._fp)
+            self._enabled = True
+        except Exception:
+            self._enabled = False
+            self._fp = None
+            self._zw = None
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self._enabled)
+
+    def write(self, obj: Dict[str, Any]) -> None:
+        if not self._enabled:
+            return
+        try:
+            self._zw.write(orjson.dumps(obj))
+            self._zw.write(b"\n")
+        except Exception:
+            return
+
+    def flush(self) -> None:
+        if not self._enabled:
+            return
+        try:
+            self._zw.flush(zstd.FLUSH_FRAME)
+        except Exception:
+            return
+
+    def close(self) -> None:
+        if not self._enabled:
+            return
+        try:
+            try:
+                self.flush()
+            except Exception:
+                pass
+            try:
+                self._zw.close()
+            except Exception:
+                pass
+            try:
+                self._fp.close()
+            except Exception:
+                pass
+        finally:
+            self._enabled = False
 
 
 class OptionalParquetWriter:

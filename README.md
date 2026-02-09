@@ -15,6 +15,8 @@ This repo is a full-stack local app:
 ## Contents
 - [Features](#features)
 - [Calibration + Raw Event Logs](#calibration--raw-event-logs)
+- [Data Dictionary](#data-dictionary)
+- [Research Playbook](#research-playbook)
 - [Screenshots / UI](#screenshots--ui)
 - [Repo Structure](#repo-structure)
 - [Quickstart](#quickstart)
@@ -25,6 +27,7 @@ This repo is a full-stack local app:
 - [Frontend Charts](#frontend-charts)
 - [Development Workflow](#development-workflow)
 - [Acceptance / Load Test](#acceptance--load-test)
+- [External Disk 1h Test](#external-disk-1h-test)
 - [Troubleshooting](#troubleshooting)
 - [Roadmap](#roadmap)
 - [License](#license)
@@ -124,6 +127,313 @@ There are **two configuration layers**:
    - `CALIB_TOB_MUST_MATCH` (default `1` / true)
 
 Recommended: keep `CALIBRATION_*` for cadence and sampling, and tune `CALIB_*` for acceptance thresholds.
+
+---
+## Data Dictionary
+
+This section defines what is stored, where each field comes from, and why each dataset exists for liquidity research.
+
+### Scope and truth model
+- The system reconstructs near-real-time **L2 orderbook state** from CLOB WS + REST calibration.
+- It does not reconstruct every individual user order action; it reconstructs their effect on visible book levels.
+- Book depth is not fixed to top-1/top-5. In-memory `BookState` stores all levels returned by source snapshots. `top_n` is used in calibration comparison only.
+
+### End-to-end data flow
+1. Universe enumeration:
+`GET /gamma/active_markets` (backend) flattens Gamma event + market metadata.
+2. Dump:
+`backend/scripts/dump_active_markets.py` writes `active_markets-*.jsonl`.
+3. Dimension build:
+`backend/scripts/build_dims_duckdb.py` writes `market_dim` + `token_dim`.
+4. Capture:
+`backend/scripts/capture_dump_shards.py` shards token ids and repeatedly calls `POST /monitor/set_tokens`.
+5. Runtime monitor:
+WS (`/ws/market`) + REST (`POST /books`) maintain state and publish `metrics_tick`.
+6. Persistence:
+metrics facts, raw audit events, compressed book delta/snapshot streams.
+7. Visualization:
+`backend/scripts/viz_liquidity_window.py` slices a window and exports CSV + SVG/PNG.
+
+### API sources and subscriptions
+- Gamma API:
+  - `GET /events` (via backend `/gamma/active_markets`)
+  - `GET /public-search` (via backend `/gamma/search`)
+  - `GET /markets` / slug lookup (via backend `/gamma/market/{slug}`)
+- CLOB WS:
+  - `wss://ws-subscriptions-clob.polymarket.com/ws/market`
+  - subscribe payload: `{"type":"market","assets_ids":[token_ids...]}`
+- CLOB REST:
+  - `GET /book` (single token snapshot)
+  - `POST /books` (batch snapshot for calibration)
+- Backend runtime API:
+  - `/monitor/set_tokens`, `/monitor/status`, `/metrics/current`, `/metrics/stream`
+
+### Dataset 1: Universe dump (`active_markets-*.jsonl`)
+Producer: `backend/scripts/dump_active_markets.py`
+
+Core market fields (Gamma):
+- `id`, `slug`, `question`, `outcomes`
+- `clobTokenIds` / `clob_token_ids`
+- `startDate`, `endDate`, `closeTime`
+- `active`, `closed`, `archived`, `acceptingOrders`, `enableOrderBook`
+
+Flattened event fields (backend `/gamma/active_markets`):
+- `event_id`, `event_slug`, `event_title`
+- `event_category`, `event_tags`
+- `event_start`, `event_end`, `event_active`, `event_closed`, `event_archived`
+
+Normalization fields (dump script):
+- `_clobTokenIds_norm`: normalized token id array
+- `_event_tags_norm`: normalized tag array
+- `_event_category_norm`: normalized category string
+
+Research use:
+- Defines capture universe and temporal cohort (`--on_date`).
+- Provides category/tag dimensions for cross-market studies.
+
+### Dataset 2: Dimension DB (`pmliq.duckdb`)
+Producer: `backend/scripts/build_dims_duckdb.py`
+
+Table `market_dim`:
+- Identity: `market_id`, `market_slug`, `question`
+- Event dimensions: `event_id`, `event_slug`, `event_title`, `event_category`, `event_tags_json`
+- Outcomes/tokens: `outcomes_json`, `clob_token_ids_json`, `clob_tokens_n`
+- State flags: `active`, `closed`, `archived`, `accepting_orders`, `enable_orderbook`
+- Lifecycle: `start_date`, `end_date`
+- Lineage: `source_dump_path`, `ingested_ts_ms`
+
+Table `token_dim`:
+- Identity: `token_id`, `market_id`, `market_slug`
+- Outcome mapping: `outcome_index`, `outcome_name`
+- Event dimensions: `event_id`, `event_slug`, `event_title`, `event_category`, `event_tags_json`
+- State flags: `active`, `closed`, `archived`
+- Lineage: `source_dump_path`, `ingested_ts_ms`
+
+Research use:
+- Stable join keys from token-level facts to market/event metadata.
+- Enables grouped comparisons by category/tag/event/outcome.
+
+### Dataset 3: Metrics facts (`data/runs/<run_id>/events.jsonl`)
+Producer: `Monitor._write_event(event="metrics_tick", ...)`
+
+Top-level fields:
+- `event`, `schema`, `run_id`
+- `ts_ms`, `exchange_ts_ms`
+- `token_id`, `source` (`ws|rest`), `reason`
+- `metrics`
+- `write_ts_ms`
+
+`metrics` fields:
+- `levels`: `{bids, asks}` number of visible levels
+- `best`: `{bid, ask}`
+- `spread`, `mid`, `spread_bps`, `two_sided`
+- `depth`: depth bands by bps (`10/25/50/100`) with bid/ask qty+notional
+- `slippage`: buy/sell impact by notional (default `100/500/1000`)
+- `slippage_filled`: fillability boolean per notional/side
+- `imbalance_topk`
+- `last_trade_price`
+- `health`:
+  - `ws_connected`
+  - `last_rest_snapshot_ts_ms`
+  - `last_compare`
+  - `rebase_count`
+
+Research use:
+- Primary fact table for spread/depth/impact timeseries.
+- Input for all window slicing, ranking, and strategy research.
+
+### Dataset 4: Raw audit log (`data/raw/<run_id>/events-*.jsonl`)
+Producer: `RawLogWriter`
+
+Record families:
+- Transport family (`kind:*`): `ws_book`, `ws_other`, `ws_price_change`, `rest_snapshot`
+- Calibration family (`event:*`): `calibration_compare`, `rebase`, `calibration_summary`
+
+Common fields:
+- `ts_ms`, `run_id`, `token_id`, `payload`, `write_ts_ms`
+- discriminator: `kind` or `event`
+
+Calibration payload highlights:
+- `calibration_compare.payload.compare`:
+  - `tob_match`, `mismatch_levels`, `mismatch_notional`, `compared_topn`, TOB prices
+- `calibration_summary.payload`:
+  - `compares`, `tob_match_rate`, `mismatch_notional_p90`, `sample_rate`, `thresholds`
+- `thresholds` schema is unified as:
+  - `thresh_top_n`
+  - `thresh_mismatch_levels`
+  - `thresh_mismatch_notional`
+  - `thresh_tob_must_match`
+  - `thresh_source`
+
+Research use:
+- Data quality diagnostics and trust scoring.
+- Distinguishes market moves from calibration/rebase artifacts.
+
+### Dataset 5: Compressed book logs (`data/books/<run_id>/*.jsonl.zst`)
+Producer: `RawLogWriter.write_books_delta`, `RawLogWriter.write_books_snapshot`
+
+Shared envelope:
+- `{ts_ms, run_id, token_id, event, payload}`
+
+`books_delta-*.jsonl.zst`:
+- `event="books_delta"`
+- `payload`:
+  - `source`
+  - `ts_ms`
+  - `delta`
+- `delta` format:
+  - `bids`: `[[price, old_size, new_size], ...]`
+  - `asks`: `[[price, old_size, new_size], ...]`
+
+`books_snapshot-*.jsonl.zst`:
+- `event="books_snapshot"`
+- `payload`:
+  - `source` (`ws|rest`)
+  - `reason` (`first_ws|calibration|rebase`)
+  - `ts_ms`
+  - `book` (full book state at that moment)
+
+Research use:
+- High-compression historical storage.
+- Better long-run capacity planning (`books_delta_mb_per_hour`) before cloud migration.
+
+### Dataset 6: Capacity and quality reports (`reports/*.csv`)
+Producers: `scale_probe.py`, `capture_dump_shards.py`
+
+Core fields:
+- Throughput:
+  - `ws_book_msgs`, `ws_other_msgs`, `*_per_s`
+- Calibration quality:
+  - `rebase_count`, `compares`, `tob_match_rate`, `mismatch_notional_p90`, `thresholds_ok`
+- Storage growth:
+  - `raw_bytes/raw_mb_per_hour`
+  - `books_delta_bytes_delta/books_delta_mb_per_hour`
+  - `books_snapshot_bytes_delta/books_snapshot_mb_per_hour`
+- Metrics coverage:
+  - `metrics_tick_count`, `metrics_tick_tokens`
+  - `metrics_mid_cov`, `metrics_spread_cov`, `metrics_depth_cov`, `metrics_slippage_cov`
+
+Research use:
+- Converts technical run logs into cost-quality dashboards.
+- Direct input for cloud sizing (S3 + warehouse + compute).
+
+### Runtime status fields (`/monitor/status`) and meaning
+- `run_id`: monitor run identity.
+- `started`: monitor loop is running.
+- `ws_connected`: WS transport connected.
+- `token_ids`: currently monitored tokens.
+- `ws_book_msgs/ws_other_msgs`: WS event counters.
+- `rest_polls`: number of REST calibration cycles.
+- `rebase_count`: number of hard resets.
+- `raw_log_path/raw_events_written`: raw audit stream location + count.
+- `books_delta_log_path/books_delta_written`: compressed delta stream location + count.
+- `books_snapshot_log_path/books_snapshot_written`: compressed snapshot stream location + count.
+- `effective_rest_poll_sec`: effective rest poll interval.
+- `effective_calibration_interval_sec`: configured calibration interval.
+- `effective_calibration_top_n`: top-N used for compare.
+- `effective_monitor_mismatch_levels`: mismatch-level threshold used for rebase gate.
+
+### Terms and definitions
+- **L2 book**: price-level aggregated orderbook (`price -> size`) by side.
+- **TOB**: top-of-book (`best_bid`, `best_ask`).
+- **mid**: `(best_bid + best_ask)/2` when two-sided.
+- **spread**: `best_ask - best_bid`.
+- **spread_bps**: `spread / mid * 10,000`.
+- **depth band (N bps)**: cumulative bid/ask quantity+notional within `mid +/- Nbps`.
+- **impact/slippage**: simulated VWAP impact for target notional buy/sell.
+- **drift**: divergence between in-memory WS-derived book and REST snapshot.
+- **rebase**: hard overwrite from REST snapshot after threshold breach.
+- **calibration_summary**: per REST cycle quality summary row.
+
+---
+## Research Playbook
+
+This section is a practical runbook for liquidity research using your current pipeline.
+
+### A) Build a research-ready dataset
+1. Build universe dump:
+`dump_active_markets.py` with desired `--on_date` (or without date for "now active").
+2. Build dimensions:
+`build_dims_duckdb.py` into your target DuckDB.
+3. Capture facts:
+`capture_dump_shards.py` with desired shard/worker strategy.
+4. Confirm data quality:
+`inspect_dataset.py --recent_sec ...` and check coverage + calibration summary.
+
+### B) Recommended capture modes
+- Single-worker debug:
+  - quick correctness and schema validation.
+- Multi-worker throughput:
+  - `--worker_apis` across multiple ports/processes.
+  - `--sort_by volume` for active-first capture.
+- Comparable randomization:
+  - add `--shuffle_seed` for reproducible token order.
+
+### C) Understand window semantics
+- `capture_dump_shards.py` runs each shard for `--shard_duration`.
+- With `N` workers and `S` shards:
+  - wall time is roughly `ceil(S/N) * shard_duration`.
+- For a true "same 15-minute global window" over all shards:
+  - need enough workers to finish all shards in one round, or increase `shard_tokens` to reduce shard count.
+
+### D) Produce visualization slices
+Use `viz_liquidity_window.py`:
+- Full window aggregate:
+  - `--start`, `--end`, `--split_outcomes`, `--y_clip_p`
+- Single market:
+  - `--market_slug`
+- Outputs:
+  - `--out_csv`
+  - `--out_svg`
+  - `--out_png` (recommended for readability)
+
+### E) Market selection strategy for readable plots
+- Avoid plotting all markets in one figure when token count is large.
+- Rank first by activity from sliced CSV:
+  - sample count per market
+  - `avg_depth_25_total_notional`
+  - `avg(spread_bps)` with minimum sample threshold
+- Then produce per-market plots for top-N.
+
+### F) Quality gates before using a slice for research
+- Monitor health:
+  - `ws_connected=true`
+  - non-zero `ws_book_msgs`, non-zero `rest_polls`
+- Calibration quality:
+  - `thresholds_ok=true`
+  - reasonable `tob_match_rate`
+  - `rebase_count` not exploding
+- Metrics completeness:
+  - `metrics_mid_cov` near 1.0
+  - `metrics_depth_cov` near 1.0
+  - `metrics_slippage_cov` near 1.0
+  - `metrics_spread_cov` can be lower on one-sided books
+
+### G) Suggested first analyses
+1. Cross-sectional liquidity ranking:
+   compare `avg_spread_bps`, `avg_depth_25_total_notional`, `avg_impact_buy_100_bps`.
+2. Stability analysis:
+   per-market variance of spread/impact over window.
+3. Stress detection:
+   detect jumps in `spread_bps` and simultaneous drops in depth.
+4. Health-adjusted filtering:
+   exclude windows with high rebase pressure.
+
+### H) Cost and cloud planning from local tests
+- Use per-hour metrics from reports:
+  - `raw_mb_per_hour`
+  - `books_delta_mb_per_hour`
+  - `books_snapshot_mb_per_hour`
+- Extrapolate by:
+  - target token coverage
+  - runtime hours/day
+  - expected retention days
+- Use `books_delta_mb_per_hour` as the primary long-horizon storage baseline.
+
+### I) Current known limitation (important)
+- This pipeline is optimized for capture from "now onward".
+- `--on_date` controls market universe selection, not true time travel replay of historical L2 states.
+- Exact historical L2 at arbitrary past timestamps requires historical archival feed retention from that period.
 
 ---
 ## Repo structure
@@ -410,6 +720,115 @@ python backend/scripts/load_test_2h.py --api http://127.0.0.1:8000 --markets 20 
 - [raw log size] backend/data/raw/local/events-*.jsonl ... (file exists)
 - [accept] thresholds: OK (rebase thresholds consistent)
 - [calibration stats] compares > 0 (unless run too short / no calibration tick)
+
+---
+## External Disk 1h Test
+
+Use this runbook to validate a 1-hour capture on an external disk before AWS deployment.
+
+Assumptions:
+- Repo remains on local SSD.
+- Only `DATA_DIR`/artifacts are redirected to external disk.
+- Example external disk root: `/Volumes/T7/PolyMarket DB`
+
+### 0) Prepare paths
+```bash
+cd /Users/caizhuoang/Desktop/Dabanc/pm-liquidity-lab
+export PMDB="/Volumes/T7/PolyMarket DB"
+mkdir -p "$PMDB/data" "$PMDB/dumps" "$PMDB/warehouse" "$PMDB/reports"
+```
+
+### 1) Start backend with disk-backed DATA_DIR
+Use a dedicated port to avoid conflicts:
+```bash
+cd backend
+DATA_DIR="$PMDB/data" RUN_ID="t7_jan01_probe" uvicorn app.main:app --host 0.0.0.0 --port 8001
+```
+
+In another terminal:
+```bash
+curl -s http://127.0.0.1:8001/health | jq
+```
+
+### 2) Build market universe for `2026-01-01`
+```bash
+cd /Users/caizhuoang/Desktop/Dabanc/pm-liquidity-lab
+python backend/scripts/dump_active_markets.py \
+  --api http://127.0.0.1:8001 \
+  --out "$PMDB/dumps" \
+  --max 5000 \
+  --page 200 \
+  --all_events \
+  --on_date 2026-01-01
+```
+
+Optional: build/update dimension DB
+```bash
+LATEST=$(ls -1t "$PMDB"/dumps/active_markets-*.jsonl | head -n 1)
+python backend/scripts/build_dims_duckdb.py \
+  --dump "$LATEST" \
+  --db "$PMDB/warehouse/pmliq.duckdb" \
+  --replace
+```
+
+### 3) Run 1-hour shard capture
+```bash
+LATEST=$(ls -1t "$PMDB"/dumps/active_markets-*.jsonl | head -n 1)
+python backend/scripts/capture_dump_shards.py \
+  --api http://127.0.0.1:8001 \
+  --dump "$LATEST" \
+  --monitorable_only \
+  --shard_tokens 100 \
+  --shard_duration 3600 \
+  --poll 10 \
+  --max_shards 1 \
+  --out "$PMDB/reports/jan01_shard_capture_1h.csv"
+```
+
+### 4) Acceptance checks
+```bash
+cat "$PMDB/reports/jan01_shard_capture_1h.csv"
+curl -s "http://127.0.0.1:8001/monitor/status" | jq '{
+  ws_connected, raw_log_path, books_delta_log_path, books_snapshot_log_path,
+  books_delta_written, books_snapshot_written, raw_events_written
+}'
+du -h "$PMDB/data/raw" "$PMDB/data/books" "$PMDB/reports"
+```
+
+Minimum Go criteria:
+- `ws_connected=true` for most of the run.
+- `metrics_tick_count > 0` and `metrics_tick_tokens > 0`.
+- `books_delta_written > 0` and `books_snapshot_written > 0`.
+- `books_delta_bytes_delta > 0` in capture report.
+- Paths in `/monitor/status` point to external disk (`/Volumes/T7/...`).
+
+### 5) Interpreting storage for cloud sizing
+- Prefer `books_delta_mb_per_hour` as replay-oriented core estimate.
+- Track `raw_mb_per_hour` separately (audit/debug overhead).
+- For planning, multiply by target token coverage and duty cycle, then apply safety factor (e.g., 1.5x).
+
+### 6) Post-run window visualization (time + market filters)
+Generate a research slice from `events.jsonl` and output both CSV and SVG:
+```bash
+python backend/scripts/viz_liquidity_window.py \
+  --api http://127.0.0.1:8001 \
+  --db "$PMDB/warehouse/pmliq.duckdb" \
+  --market_slug "microstrategy-sell-any-bitcoin-in-2025" \
+  --start "2026-02-06T09:00:00+08:00" \
+  --end   "2026-02-06T10:00:00+08:00" \
+  --out_csv "$PMDB/reports/liquidity_slice_1h.csv" \
+  --out_svg "$PMDB/reports/liquidity_slice_1h.svg"
+```
+
+Quick recent-window example (no explicit time range):
+```bash
+python backend/scripts/viz_liquidity_window.py \
+  --api http://127.0.0.1:8001 \
+  --db "$PMDB/warehouse/pmliq.duckdb" \
+  --recent_sec 1800 \
+  --out_csv "$PMDB/reports/liquidity_slice_recent.csv" \
+  --out_svg "$PMDB/reports/liquidity_slice_recent.svg"
+```
 
 ---
 ## Troubleshooting
