@@ -19,6 +19,7 @@ class RawLogStatus:
     books_snapshot_path: Optional[str] = None
     books_delta_written: int = 0
     books_snapshot_written: int = 0
+    books_snapshot_rle_written: int = 0
 
 
 class RawLogWriter:
@@ -110,6 +111,21 @@ class RawLogWriter:
         self._books_snapshot_writer.flush()
         if self._books_snapshot_writer.enabled:
             self.status.books_snapshot_written += 1
+
+    def write_books_snapshot_rle(self, token_id: str, payload: Dict[str, Any]) -> None:
+        ts_ms = int(time.time() * 1000)
+        rec = {
+            "ts_ms": ts_ms,
+            "run_id": self.status.run_id,
+            "token_id": token_id,
+            "event": "books_snapshot_rle",
+            "payload": payload,
+        }
+        # Reuse snapshot stream; distinguish by event type.
+        self._books_snapshot_writer.write(rec)
+        self._books_snapshot_writer.flush()
+        if self._books_snapshot_writer.enabled:
+            self.status.books_snapshot_rle_written += 1
 
     @property
     def books_writers_enabled(self) -> bool:

@@ -21,6 +21,11 @@ class Settings(BaseSettings):
     # Calibration
     CALIBRATION_INTERVAL_SEC: int = 30
     CALIBRATION_TOP_N: int = 50
+    BOOK_STORE_TOP_K: int = 0  # 0 = keep full depth for persisted books
+    BOOK_RLE_ENABLED: bool = True
+    BOOK_RLE_HEARTBEAT_SEC: int = 30
+    BOOK_STATE_HASH_MODE: str = "full"
+    METRICS_EMIT_ENABLED: bool = True
 
     # Liquidity metrics defaults
     LIQ_NOTIONALS: List[float] = [100.0, 500.0, 1000.0]

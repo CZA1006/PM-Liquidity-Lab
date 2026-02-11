@@ -15,6 +15,9 @@ class GammaClient:
         offset: int = 0,
         order: Optional[str] = "volume_num",
         ascending: bool = False,
+        active: Optional[bool] = None,
+        closed: Optional[bool] = None,
+        archived: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """
         Gamma /markets supports query params: limit, offset, order, ascending, etc.
@@ -23,17 +26,33 @@ class GammaClient:
         """
         url = f"{self.base}/markets"
 
+        def _with_filters(params: Dict[str, Any]) -> Dict[str, Any]:
+            out = dict(params)
+            if active is not None:
+                out["active"] = "true" if active else "false"
+            if closed is not None:
+                out["closed"] = "true" if closed else "false"
+            if archived is not None:
+                out["archived"] = "true" if archived else "false"
+            return out
+
         # candidate param sets (most -> least opinionated)
         candidates: List[Dict[str, Any]] = []
 
         if order is not None:
-            candidates.append({"limit": limit, "offset": offset, "order": order, "ascending": ascending})
+            candidates.append(
+                _with_filters({"limit": limit, "offset": offset, "order": order, "ascending": ascending})
+            )
             # common fallback: camelCase field names
-            candidates.append({"limit": limit, "offset": offset, "order": "volumeNum", "ascending": ascending})
-            candidates.append({"limit": limit, "offset": offset, "order": "liquidityNum", "ascending": ascending})
+            candidates.append(
+                _with_filters({"limit": limit, "offset": offset, "order": "volumeNum", "ascending": ascending})
+            )
+            candidates.append(
+                _with_filters({"limit": limit, "offset": offset, "order": "liquidityNum", "ascending": ascending})
+            )
 
         # safest fallback: no ordering at all
-        candidates.append({"limit": limit, "offset": offset})
+        candidates.append(_with_filters({"limit": limit, "offset": offset}))
 
         last_err: Optional[Exception] = None
 

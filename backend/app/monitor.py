@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
 import random
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -83,6 +86,10 @@ class MonitorStatus:
     books_snapshot_log_path: str = ""
     books_delta_written: int = 0
     books_snapshot_written: int = 0
+    books_snapshot_rle_written: int = 0
+    book_store_top_k: int = 0
+    book_rle_enabled: bool = False
+    book_rle_heartbeat_sec: int = 0
     compare_total: int = 0
     compare_tob_match: int = 0
     compare_mismatch_notional_samples: List[float] = field(default_factory=list)
@@ -93,6 +100,19 @@ class MonitorStatus:
     effective_calibration_interval_sec: int = 0
     effective_calibration_top_n: int = 0
     effective_monitor_mismatch_levels: int = 0
+    # ---- rest poll observability (no behavior change) ----
+    last_rest_poll_rtt_ms: float = 0.0
+    rest_poll_rtt_ms_p50: float = 0.0
+    rest_poll_rtt_ms_p90: float = 0.0
+    rest_poll_rtt_ms_p99: float = 0.0
+    snapshot_age_sample_count: int = 0
+    snapshot_age_negative_count: int = 0
+    last_snapshot_age_ms_p50: float = 0.0
+    last_snapshot_age_ms_p90: float = 0.0
+    last_snapshot_age_ms_p99: float = 0.0
+    snapshot_age_ms_p50: float = 0.0
+    snapshot_age_ms_p90: float = 0.0
+    snapshot_age_ms_p99: float = 0.0
 
 
 class MetricsHub:
@@ -176,11 +196,28 @@ class Monitor:
         self._seen_ws_tokens: Set[str] = set()
         # WS-only baseline for delta logging; keep independent from REST rebases.
         self._ws_prev_books: Dict[str, Tuple[Dict[float, float], Dict[float, float]]] = {}
+        self._rle_state: Dict[str, Dict[str, Any]] = {}
+        self._book_store_top_k: int = max(0, int(getattr(self.settings, "BOOK_STORE_TOP_K", 0) or 0))
+        self._book_rle_enabled: bool = bool(getattr(self.settings, "BOOK_RLE_ENABLED", True))
+        self._book_rle_heartbeat_sec: int = max(
+            1, int(getattr(self.settings, "BOOK_RLE_HEARTBEAT_SEC", 30) or 30)
+        )
         # effective config snapshots (for /monitor/status observability)
         self._effective_rest_poll_sec: float = float(self.settings.CALIBRATION_INTERVAL_SEC)
         self._effective_calibration_interval_sec: int = int(self.settings.CALIBRATION_INTERVAL_SEC)
         self._effective_calibration_top_n: int = int(self.settings.CALIBRATION_TOP_N)
         self._effective_monitor_mismatch_levels: int = int(self.settings.MONITOR_MISMATCH_LEVELS)
+        # ---- rest poll observability buffers ----
+        self._last_rest_poll_rtt_ms: float = 0.0
+        self._rest_poll_rtt_ms_samples: List[float] = []
+        self._rest_snapshot_age_ms_samples: List[float] = []
+        self._snapshot_age_sample_count: int = 0
+        self._snapshot_age_negative_count: int = 0
+        self._last_snapshot_age_ms_p50: float = 0.0
+        self._last_snapshot_age_ms_p90: float = 0.0
+        self._last_snapshot_age_ms_p99: float = 0.0
+        self._rest_obs_max_rtt_samples: int = 2048
+        self._rest_obs_max_age_samples: int = 50000
 
     def _write_event(self, *, event: str, schema: str, **fields: Any) -> None:
         safe_write(
@@ -213,8 +250,18 @@ class Monitor:
         self.book_states = {tid: BookState(token_id=tid) for tid in self.token_ids}
         self._seen_ws_tokens = set()
         self._ws_prev_books = {}
+        self._rle_state = {}
 
-        await self._apply_rest_snapshot_and_publish(reason="bootstrap")
+        try:
+            await self._apply_rest_snapshot_and_publish(reason="bootstrap")
+        except Exception as e:
+            # Keep monitor startup resilient: WS can still run and REST loop will retry.
+            self._write_event(
+                event="generic_error",
+                schema=schemas.GENERIC_ERROR_V1,
+                stage="bootstrap_rest",
+                error=f"{type(e).__name__}: {e}",
+            )
 
         self._tasks = [
             asyncio.create_task(self._ws_loop(), name="monitor_ws_loop"),
@@ -240,6 +287,9 @@ class Monitor:
         self._tasks = []
         self._started = False
         self.ws_connected = False
+        for tid in list(self._rle_state.keys()):
+            self._flush_rle_span(tid)
+        self._rle_state = {}
         try:
             self.raw.close()
         except Exception:
@@ -250,6 +300,12 @@ class Monitor:
         )
 
     def status(self) -> MonitorStatus:
+        rtt_p50 = self._percentile(self._rest_poll_rtt_ms_samples, 50.0) or 0.0
+        rtt_p90 = self._percentile(self._rest_poll_rtt_ms_samples, 90.0) or 0.0
+        rtt_p99 = self._percentile(self._rest_poll_rtt_ms_samples, 99.0) or 0.0
+        age_p50 = self._percentile(self._rest_snapshot_age_ms_samples, 50.0) or 0.0
+        age_p90 = self._percentile(self._rest_snapshot_age_ms_samples, 90.0) or 0.0
+        age_p99 = self._percentile(self._rest_snapshot_age_ms_samples, 99.0) or 0.0
         return MonitorStatus(
             run_id=self.run_id,
             started=self._started,
@@ -268,6 +324,10 @@ class Monitor:
             books_snapshot_log_path=self.raw.status.books_snapshot_path or "",
             books_delta_written=self.raw.status.books_delta_written,
             books_snapshot_written=self.raw.status.books_snapshot_written,
+            books_snapshot_rle_written=self.raw.status.books_snapshot_rle_written,
+            book_store_top_k=self._book_store_top_k,
+            book_rle_enabled=self._book_rle_enabled,
+            book_rle_heartbeat_sec=self._book_rle_heartbeat_sec,
             compare_total=self.compare_total,
             compare_tob_match=self.compare_tob_match,
             compare_mismatch_notional_samples=self.compare_mismatch_notional_samples,
@@ -277,6 +337,18 @@ class Monitor:
             effective_calibration_interval_sec=self._effective_calibration_interval_sec,
             effective_calibration_top_n=self._effective_calibration_top_n,
             effective_monitor_mismatch_levels=self._effective_monitor_mismatch_levels,
+            last_rest_poll_rtt_ms=float(self._last_rest_poll_rtt_ms),
+            rest_poll_rtt_ms_p50=float(rtt_p50),
+            rest_poll_rtt_ms_p90=float(rtt_p90),
+            rest_poll_rtt_ms_p99=float(rtt_p99),
+            snapshot_age_sample_count=int(self._snapshot_age_sample_count),
+            snapshot_age_negative_count=int(self._snapshot_age_negative_count),
+            last_snapshot_age_ms_p50=float(self._last_snapshot_age_ms_p50),
+            last_snapshot_age_ms_p90=float(self._last_snapshot_age_ms_p90),
+            last_snapshot_age_ms_p99=float(self._last_snapshot_age_ms_p99),
+            snapshot_age_ms_p50=float(age_p50),
+            snapshot_age_ms_p90=float(age_p90),
+            snapshot_age_ms_p99=float(age_p99),
         )
 
     def _empty_metrics_tick(self, token_id: str) -> Dict[str, Any]:
@@ -336,7 +408,13 @@ class Monitor:
             candidate_token_ids = []
 
         if not candidate_token_ids:
-            markets = await self.gamma.list_markets(limit=50, offset=0)
+            markets = await self.gamma.list_markets(
+                limit=50,
+                offset=0,
+                active=True,
+                closed=False,
+                archived=False,
+            )
             candidate_token_ids = pick_tokens_from_markets(markets, keyword=keyword, pick_n=30)
 
         pick_n = int(self.settings.MONITOR_PICK_TOKENS or 3)
@@ -377,6 +455,7 @@ class Monitor:
         self.latest_metrics = {}
         self._seen_ws_tokens = set()
         self._ws_prev_books = {}
+        self._rle_state = {}
 
         if restart and not self._started:
             await self.start()
@@ -455,6 +534,9 @@ class Monitor:
         self.latest_metrics[tid] = out
         self.last_publish_ts_ms = ts_ms
 
+        if not bool(getattr(self.settings, "METRICS_EMIT_ENABLED", True)):
+            return
+
         self._write_event(
             event="metrics_tick",
             schema="metrics_tick_v1",
@@ -475,16 +557,10 @@ class Monitor:
         first_ws = tid not in self._seen_ws_tokens
         st = self.book_states[tid]
         old_bids, old_asks = self._ws_prev_books.get(tid, ({}, {}))
-        new_bids = {
-            float(p): float(s)
-            for p, s in (nb.get("bids") or [])
-            if p is not None and s is not None
-        }
-        new_asks = {
-            float(p): float(s)
-            for p, s in (nb.get("asks") or [])
-            if p is not None and s is not None
-        }
+        new_bids_levels = self._trim_levels(nb.get("bids") or [], "bids", self._book_store_top_k)
+        new_asks_levels = self._trim_levels(nb.get("asks") or [], "asks", self._book_store_top_k)
+        new_bids = {float(p): float(s) for p, s in new_bids_levels if p is not None and s is not None}
+        new_asks = {float(p): float(s) for p, s in new_asks_levels if p is not None and s is not None}
         self._raw_write("ws_book", {"msg": msg}, token_id=tid)
         st.apply_snapshot(
             nb.get("bids") or [],
@@ -501,7 +577,12 @@ class Monitor:
             if delta.get("bids") or delta.get("asks"):
                 self.raw.write_books_delta(
                     token_id=tid,
-                    payload={"ts_ms": _now_ms(), "source": "ws", "delta": delta},
+                    payload={
+                        "ts_ms": _now_ms(),
+                        "source": "ws",
+                        "delta": delta,
+                        "top_k_applied": self._book_store_top_k,
+                    },
                 )
             self._ws_prev_books[tid] = (new_bids, new_asks)
         except Exception:
@@ -512,9 +593,11 @@ class Monitor:
             try:
                 snap = self._snapshot_from_state(tid)
                 if snap:
-                    self.raw.write_books_snapshot(
+                    self._write_snapshot_with_rle(
                         token_id=tid,
-                        payload={"ts_ms": _now_ms(), "source": "ws", "reason": "first_ws", "book": snap},
+                        source="ws",
+                        reason="first_ws",
+                        book=snap,
                     )
             except Exception:
                 pass
@@ -539,13 +622,149 @@ class Monitor:
         st = self.book_states.get(token_id)
         if not st:
             return None
-        bids = [[p, s] for p, s in st.bids.items()]
-        asks = [[p, s] for p, s in st.asks.items()]
+        bids = self._trim_levels([[p, s] for p, s in st.bids.items()], "bids", self._book_store_top_k)
+        asks = self._trim_levels([[p, s] for p, s in st.asks.items()], "asks", self._book_store_top_k)
         return {
             "token_id": token_id,
             "bids": bids,
             "asks": asks,
             "exchange_ts_ms": st.exchange_ts_ms,
+        }
+
+    def _trim_levels(self, levels: List[List[float]], side: str, top_k: int) -> List[List[float]]:
+        out: List[List[float]] = []
+        for lv in levels:
+            try:
+                p = float(lv[0])
+                s = float(lv[1])
+            except Exception:
+                continue
+            if p <= 0 or s <= 0:
+                continue
+            out.append([p, s])
+        if side == "bids":
+            out.sort(key=lambda x: x[0], reverse=True)
+        else:
+            out.sort(key=lambda x: x[0])
+        if top_k and top_k > 0:
+            out = out[:top_k]
+        return out
+
+    @staticmethod
+    def _norm_num(x: Any) -> str:
+        try:
+            v = float(x)
+        except Exception:
+            v = 0.0
+        s = f"{v:.12f}".rstrip("0").rstrip(".")
+        return s if s else "0"
+
+    def _book_state_hash(self, book: Dict[str, Any]) -> str:
+        mode = str(getattr(self.settings, "BOOK_STATE_HASH_MODE", "full") or "full").lower()
+        obj = {
+            "bids": [[self._norm_num(p), self._norm_num(s)] for p, s in (book.get("bids") or [])],
+            "asks": [[self._norm_num(p), self._norm_num(s)] for p, s in (book.get("asks") or [])],
+        }
+        if mode != "full":
+            obj = {
+                "bids": obj["bids"][:1],
+                "asks": obj["asks"][:1],
+            }
+        body = json.dumps(obj, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha1(body.encode("utf-8")).hexdigest()
+
+    def _flush_rle_span(self, token_id: str) -> None:
+        if not self.raw or token_id not in self._rle_state:
+            return
+        st = self._rle_state[token_id]
+        repeat_count = int(st.get("repeat_count") or 0)
+        if repeat_count <= 1:
+            return
+        payload = {
+            "source": st.get("source"),
+            "reason": st.get("reason"),
+            "state_hash": st.get("state_hash"),
+            "span_start_ts_ms": st.get("span_start_ts_ms"),
+            "span_end_ts_ms": st.get("span_end_ts_ms"),
+            "repeat_count": repeat_count,
+            "top_k_applied": st.get("top_k_applied", self._book_store_top_k),
+        }
+        try:
+            self.raw.write_books_snapshot_rle(token_id=token_id, payload=payload)
+        except Exception:
+            pass
+
+    def _write_snapshot_with_rle(
+        self,
+        *,
+        token_id: str,
+        source: str,
+        reason: str,
+        book: Dict[str, Any],
+        ts_ms: Optional[int] = None,
+    ) -> None:
+        if not self.raw:
+            return
+        ts = int(ts_ms or _now_ms())
+        state_hash = self._book_state_hash(book)
+        top_k = self._book_store_top_k
+
+        if not self._book_rle_enabled:
+            self.raw.write_books_snapshot(
+                token_id=token_id,
+                payload={
+                    "ts_ms": ts,
+                    "source": source,
+                    "reason": reason,
+                    "book": book,
+                    "state_hash": state_hash,
+                    "top_k_applied": top_k,
+                },
+            )
+            return
+
+        prev = self._rle_state.get(token_id)
+        if prev and prev.get("state_hash") == state_hash:
+            prev["span_end_ts_ms"] = ts
+            prev["repeat_count"] = int(prev.get("repeat_count") or 0) + 1
+            prev["source"] = source
+            prev["reason"] = reason
+            span_start = int(prev.get("span_start_ts_ms") or ts)
+            if ts - span_start >= self._book_rle_heartbeat_sec * 1000:
+                self._flush_rle_span(token_id)
+                self._rle_state[token_id] = {
+                    "state_hash": state_hash,
+                    "span_start_ts_ms": ts,
+                    "span_end_ts_ms": ts,
+                    "repeat_count": 1,
+                    "source": source,
+                    "reason": reason,
+                    "top_k_applied": top_k,
+                }
+            return
+
+        if prev:
+            self._flush_rle_span(token_id)
+
+        self.raw.write_books_snapshot(
+            token_id=token_id,
+            payload={
+                "ts_ms": ts,
+                "source": source,
+                "reason": reason,
+                "book": book,
+                "state_hash": state_hash,
+                "top_k_applied": top_k,
+            },
+        )
+        self._rle_state[token_id] = {
+            "state_hash": state_hash,
+            "span_start_ts_ms": ts,
+            "span_end_ts_ms": ts,
+            "repeat_count": 1,
+            "source": source,
+            "reason": reason,
+            "top_k_applied": top_k,
         }
 
     def _delta_from_maps(
@@ -746,9 +965,17 @@ class Monitor:
                 cycle_compares = 0
                 cycle_tob_match = 0
                 cycle_mismatch_notional: List[float] = []
+                cycle_snapshot_age_ms: List[float] = []
+                cycle_snapshot_age_negative_count = 0
+                poll_t0 = time.perf_counter()
                 snaps = await self.rest.post_books(self.token_ids)
+                poll_rtt_ms = max(0.0, (time.perf_counter() - poll_t0) * 1000.0)
                 self.rest_polls += 1
                 self.last_rest_poll_ts_ms = _now_ms()
+                self._last_rest_poll_rtt_ms = float(poll_rtt_ms)
+                self._rest_poll_rtt_ms_samples.append(float(poll_rtt_ms))
+                if len(self._rest_poll_rtt_ms_samples) > self._rest_obs_max_rtt_samples:
+                    self._rest_poll_rtt_ms_samples = self._rest_poll_rtt_ms_samples[-self._rest_obs_max_rtt_samples :]
 
                 self._write_event(
                     event="rest_poll",
@@ -765,6 +992,13 @@ class Monitor:
                         tid = nb.get("token_id") or ""
                         if not tid or tid not in self.book_states:
                             continue
+                        exch_ms = extract_exchange_ts_ms(nb)
+                        if isinstance(exch_ms, int):
+                            age_ms = int(self.last_rest_poll_ts_ms) - int(exch_ms)
+                            if age_ms >= 0:
+                                cycle_snapshot_age_ms.append(float(age_ms))
+                            else:
+                                cycle_snapshot_age_negative_count += 1
                         self.last_rest_snapshot_ts_ms = _now_ms()
                         cur = self.book_states[tid]
                         # Compare using the same Top-N as the calibration settings
@@ -836,14 +1070,11 @@ class Monitor:
                                 try:
                                     snap = self._snapshot_from_state(tid)
                                     if snap:
-                                        self.raw.write_books_snapshot(
+                                        self._write_snapshot_with_rle(
                                             token_id=tid,
-                                            payload={
-                                                "ts_ms": _now_ms(),
-                                                "source": "rest",
-                                                "reason": "rebase",
-                                                "book": snap,
-                                            },
+                                            source="rest",
+                                            reason="rebase",
+                                            book=snap,
                                         )
                                 except Exception:
                                     pass
@@ -866,18 +1097,63 @@ class Monitor:
                                 try:
                                     snap = self._snapshot_from_state(tid)
                                     if snap:
-                                        self.raw.write_books_snapshot(
+                                        self._write_snapshot_with_rle(
                                             token_id=tid,
-                                            payload={
-                                                "ts_ms": _now_ms(),
-                                                "source": "rest",
-                                                "reason": "calibration",
-                                                "book": snap,
-                                            },
+                                            source="rest",
+                                            reason="calibration",
+                                            book=snap,
                                         )
                                 except Exception:
                                     pass
                             await self._publish_metrics_from_snapshot(nb, source="rest", reason="rest_book")
+
+                self._snapshot_age_sample_count = len(cycle_snapshot_age_ms)
+                self._snapshot_age_negative_count = int(cycle_snapshot_age_negative_count)
+                if cycle_snapshot_age_ms:
+                    self._last_snapshot_age_ms_p50 = float(self._percentile(cycle_snapshot_age_ms, 50.0) or 0.0)
+                    self._last_snapshot_age_ms_p90 = float(self._percentile(cycle_snapshot_age_ms, 90.0) or 0.0)
+                    self._last_snapshot_age_ms_p99 = float(self._percentile(cycle_snapshot_age_ms, 99.0) or 0.0)
+                    self._rest_snapshot_age_ms_samples.extend(cycle_snapshot_age_ms)
+                    if len(self._rest_snapshot_age_ms_samples) > self._rest_obs_max_age_samples:
+                        self._rest_snapshot_age_ms_samples = self._rest_snapshot_age_ms_samples[
+                            -self._rest_obs_max_age_samples :
+                        ]
+                else:
+                    self._last_snapshot_age_ms_p50 = 0.0
+                    self._last_snapshot_age_ms_p90 = 0.0
+                    self._last_snapshot_age_ms_p99 = 0.0
+
+                obs_payload = {
+                    "rtt_ms": float(self._last_rest_poll_rtt_ms),
+                    "rest_books_count": len(snaps) if isinstance(snaps, list) else None,
+                    "snapshot_age_sample_count": int(self._snapshot_age_sample_count),
+                    "snapshot_age_negative_count": int(self._snapshot_age_negative_count),
+                    "snapshot_age_ms_p50": float(self._last_snapshot_age_ms_p50),
+                    "snapshot_age_ms_p90": float(self._last_snapshot_age_ms_p90),
+                    "snapshot_age_ms_p99": float(self._last_snapshot_age_ms_p99),
+                    "rtt_ms_p50": float(self._percentile(self._rest_poll_rtt_ms_samples, 50.0) or 0.0),
+                    "rtt_ms_p90": float(self._percentile(self._rest_poll_rtt_ms_samples, 90.0) or 0.0),
+                    "rtt_ms_p99": float(self._percentile(self._rest_poll_rtt_ms_samples, 99.0) or 0.0),
+                    "snapshot_age_ms_roll_p50": float(self._percentile(self._rest_snapshot_age_ms_samples, 50.0) or 0.0),
+                    "snapshot_age_ms_roll_p90": float(self._percentile(self._rest_snapshot_age_ms_samples, 90.0) or 0.0),
+                    "snapshot_age_ms_roll_p99": float(self._percentile(self._rest_snapshot_age_ms_samples, 99.0) or 0.0),
+                }
+                self._write_event(
+                    event="rest_poll_observe",
+                    schema="rest_poll_observe_v1",
+                    **obs_payload,
+                )
+                if self.raw:
+                    try:
+                        self.raw.write_event(
+                            run_id=self.run_id,
+                            token_id=None,
+                            event="rest_poll_observe",
+                            payload=obs_payload,
+                            ts_ms=self.last_rest_poll_ts_ms,
+                        )
+                    except Exception:
+                        pass
 
                 if self.raw:
                     try:

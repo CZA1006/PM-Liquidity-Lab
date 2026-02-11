@@ -139,7 +139,13 @@ async def run_probe(duration_sec: int, keyword: str, pick_tokens: int, markets_l
 
     # --- fallback list_markets path ---
     if not candidate_token_ids:
-        markets = await gamma.list_markets(limit=markets_limit, offset=0)
+        markets = await gamma.list_markets(
+            limit=markets_limit,
+            offset=0,
+            active=True,
+            closed=False,
+            archived=False,
+        )
         candidate_token_ids = pick_tokens_from_markets(markets, keyword=keyword, pick_n=30)
 
     # --- Phase 1.1: choose active tokens by one /books snapshot ---

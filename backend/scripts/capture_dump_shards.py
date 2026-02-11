@@ -102,8 +102,8 @@ def _market_volume_score(m: Dict[str, Any]) -> float:
     return 0.0
 
 
-def _collect_tokens_from_dump(
-    dump_path: Path,
+def _collect_tokens_from_markets(
+    markets: Iterable[Dict[str, Any]],
     monitorable_only: bool = True,
     sort_by: str = "none",
     shuffle_seed: Optional[int] = None,
@@ -112,40 +112,33 @@ def _collect_tokens_from_dump(
     out: List[str] = []
     first_idx: Dict[str, int] = {}
     token_score: Dict[str, float] = {}
-    with open(dump_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
+
+    for m in markets:
+        if not isinstance(m, dict):
+            continue
+        if monitorable_only:
+            if m.get("archived") is True:
                 continue
-            try:
-                m = json.loads(line)
-            except Exception:
+            if m.get("enableOrderBook") is False:
                 continue
-            if not isinstance(m, dict):
+            # Prefer markets that are likely tradable now.
+            if m.get("closed") is True:
                 continue
-            if monitorable_only:
-                if m.get("archived") is True:
-                    continue
-                if m.get("enableOrderBook") is False:
-                    continue
-                # Prefer markets that are likely tradable now.
-                if m.get("closed") is True:
-                    continue
-                if m.get("acceptingOrders") is False:
-                    continue
-                if m.get("active") is False:
-                    continue
-            tids = _parse_token_ids(m)
-            score = _market_volume_score(m) if sort_by == "volume" else 0.0
-            for t in tids:
-                if t not in seen:
-                    seen.add(t)
-                    first_idx[t] = len(out)
-                    out.append(t)
-                if sort_by == "volume":
-                    prev = token_score.get(t, float("-inf"))
-                    if score > prev:
-                        token_score[t] = score
+            if m.get("acceptingOrders") is False:
+                continue
+            if m.get("active") is False:
+                continue
+        tids = _parse_token_ids(m)
+        score = _market_volume_score(m) if sort_by == "volume" else 0.0
+        for t in tids:
+            if t not in seen:
+                seen.add(t)
+                first_idx[t] = len(out)
+                out.append(t)
+            if sort_by == "volume":
+                prev = token_score.get(t, float("-inf"))
+                if score > prev:
+                    token_score[t] = score
 
     if sort_by == "volume":
         out.sort(key=lambda t: (-token_score.get(t, 0.0), first_idx.get(t, 0)))
@@ -155,6 +148,65 @@ def _collect_tokens_from_dump(
         rnd.shuffle(out)
 
     return out
+
+
+def _collect_tokens_from_dump(
+    dump_path: Path,
+    monitorable_only: bool = True,
+    sort_by: str = "none",
+    shuffle_seed: Optional[int] = None,
+) -> List[str]:
+    markets: List[Dict[str, Any]] = []
+    with open(dump_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                m = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(m, dict):
+                markets.append(m)
+    return _collect_tokens_from_markets(
+        markets,
+        monitorable_only=monitorable_only,
+        sort_by=sort_by,
+        shuffle_seed=shuffle_seed,
+    )
+
+
+def _collect_tokens_from_active_api(
+    api: str,
+    monitorable_only: bool = True,
+    sort_by: str = "none",
+    shuffle_seed: Optional[int] = None,
+    page_size: int = 200,
+    max_pages: int = 500,
+) -> List[str]:
+    markets: List[Dict[str, Any]] = []
+    offset = 0
+    for _ in range(max_pages):
+        url = (
+            f"{api.rstrip('/')}/gamma/active_markets"
+            f"?limit={int(page_size)}&offset={int(offset)}&active_only=true"
+        )
+        payload = http_get_json(url)
+        if not isinstance(payload, dict):
+            break
+        batch = payload.get("markets") or []
+        if not isinstance(batch, list) or not batch:
+            break
+        for m in batch:
+            if isinstance(m, dict):
+                markets.append(m)
+        offset += int(page_size)
+    return _collect_tokens_from_markets(
+        markets,
+        monitorable_only=monitorable_only,
+        sort_by=sort_by,
+        shuffle_seed=shuffle_seed,
+    )
 
 
 def _chunks(xs: List[str], n: int) -> Iterable[List[str]]:
@@ -331,6 +383,14 @@ def _run_one_shard(
         "books_delta_written": _to_int(last.get("books_delta_written")) - _to_int(st0.get("books_delta_written")),
         "books_snapshot_written": _to_int(last.get("books_snapshot_written"))
         - _to_int(st0.get("books_snapshot_written")),
+        "books_snapshot_rle_written": _to_int(last.get("books_snapshot_rle_written"))
+        - _to_int(st0.get("books_snapshot_rle_written")),
+        "book_store_top_k": _to_int(last.get("book_store_top_k") or st0.get("book_store_top_k")),
+        "book_rle_enabled": bool(
+            last.get("book_rle_enabled")
+            if "book_rle_enabled" in last
+            else st0.get("book_rle_enabled")
+        ),
         "raw_bytes_delta": raw_delta,
         "books_delta_bytes_delta": delta_delta,
         "books_snapshot_bytes_delta": snap_delta,
@@ -365,6 +425,12 @@ def main() -> None:
     ap.add_argument("--shard_duration", type=int, default=300, help="seconds per shard")
     ap.add_argument("--poll", type=int, default=10, help="seconds between status polls")
     ap.add_argument("--max_shards", type=int, default=0, help="0 means all shards")
+    ap.add_argument(
+        "--refresh_active_every_sec",
+        type=int,
+        default=0,
+        help=">0 enables live active refresh + auto-repartition before each worker wave",
+    )
     ap.add_argument("--monitorable_only", action="store_true", help="skip archived/disableOrderBook markets")
     ap.add_argument("--sort_by", choices=["none", "volume"], default="none", help="token ordering before sharding")
     ap.add_argument("--shuffle_seed", type=int, default=None, help="optional deterministic shuffle seed")
@@ -422,6 +488,9 @@ def main() -> None:
         "raw_events_written",
         "books_delta_written",
         "books_snapshot_written",
+        "books_snapshot_rle_written",
+        "book_store_top_k",
+        "book_rle_enabled",
         "raw_bytes_delta",
         "books_delta_bytes_delta",
         "books_snapshot_bytes_delta",
@@ -439,42 +508,129 @@ def main() -> None:
         "books_snapshot_log_path",
     ]
 
-    jobs: List[Tuple[int, List[str], str]] = []
-    for idx, shard in enumerate(shards, start=1):
-        api = worker_apis[(idx - 1) % len(worker_apis)]
-        jobs.append((idx, shard, api))
-
     rows: List[Dict[str, Any]] = []
-    if len(worker_apis) <= 1:
-        for idx, shard, api in jobs:
-            rows.append(
-                _run_one_shard(
-                    api=api,
-                    shard_idx=idx,
-                    total_shards=len(shards),
-                    shard=shard,
-                    dump_path=dump_path,
-                    shard_duration=int(args.shard_duration),
-                    poll=int(args.poll),
+    refresh_sec = max(0, int(args.refresh_active_every_sec or 0))
+
+    if refresh_sec <= 0:
+        jobs: List[Tuple[int, List[str], str]] = []
+        for idx, shard in enumerate(shards, start=1):
+            api = worker_apis[(idx - 1) % len(worker_apis)]
+            jobs.append((idx, shard, api))
+
+        if len(worker_apis) <= 1:
+            for idx, shard, api in jobs:
+                rows.append(
+                    _run_one_shard(
+                        api=api,
+                        shard_idx=idx,
+                        total_shards=len(shards),
+                        shard=shard,
+                        dump_path=dump_path,
+                        shard_duration=int(args.shard_duration),
+                        poll=int(args.poll),
+                    )
                 )
-            )
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(worker_apis)) as ex:
+                futs = [
+                    ex.submit(
+                        _run_one_shard,
+                        api,
+                        idx,
+                        len(shards),
+                        shard,
+                        dump_path,
+                        int(args.shard_duration),
+                        int(args.poll),
+                    )
+                    for idx, shard, api in jobs
+                ]
+                for fut in concurrent.futures.as_completed(futs):
+                    rows.append(fut.result())
     else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(worker_apis)) as ex:
-            futs = [
-                ex.submit(
-                    _run_one_shard,
-                    api,
-                    idx,
-                    len(shards),
-                    shard,
-                    dump_path,
-                    int(args.shard_duration),
-                    int(args.poll),
+        # Live mode: refresh active universe and auto-repartition before worker waves.
+        target_total_shards = int(args.max_shards) if int(args.max_shards) > 0 else len(shards)
+        processed = 0
+        next_refresh_ts = 0.0
+        cur_shards: List[List[str]] = []
+        cur_cursor = 0
+
+        while processed < target_total_shards:
+            now = time.time()
+            need_refresh = (not cur_shards) or (now >= next_refresh_ts)
+            if need_refresh:
+                live_tokens = _collect_tokens_from_active_api(
+                    args.api,
+                    monitorable_only=bool(args.monitorable_only),
+                    sort_by=str(args.sort_by),
+                    shuffle_seed=args.shuffle_seed,
                 )
-                for idx, shard, api in jobs
-            ]
-            for fut in concurrent.futures.as_completed(futs):
-                rows.append(fut.result())
+                if live_tokens:
+                    cur_shards = list(_chunks(live_tokens, shard_size))
+                    cur_cursor = 0
+                    next_refresh_ts = now + float(refresh_sec)
+                    print(
+                        f"[refresh] active tokens={len(live_tokens)} "
+                        f"shards={len(cur_shards)} shard_tokens={shard_size}"
+                    )
+                else:
+                    # Keep existing shards if refresh fails; fallback once from dump if needed.
+                    if not cur_shards:
+                        cur_shards = shards
+                        cur_cursor = 0
+                    next_refresh_ts = now + float(refresh_sec)
+                    print("[warn] live active refresh returned no tokens; keep previous shard plan")
+
+            if not cur_shards:
+                break
+
+            remaining = target_total_shards - processed
+            wave_n = min(len(worker_apis), remaining, len(cur_shards) - cur_cursor)
+            if wave_n <= 0:
+                # Exhausted current shard plan; force immediate refresh.
+                next_refresh_ts = 0.0
+                continue
+
+            wave_jobs: List[Tuple[int, List[str], str]] = []
+            for i in range(wave_n):
+                shard_idx = processed + i + 1
+                shard = cur_shards[cur_cursor + i]
+                api = worker_apis[i % len(worker_apis)]
+                wave_jobs.append((shard_idx, shard, api))
+
+            if len(wave_jobs) <= 1:
+                idx, shard, api = wave_jobs[0]
+                rows.append(
+                    _run_one_shard(
+                        api=api,
+                        shard_idx=idx,
+                        total_shards=target_total_shards,
+                        shard=shard,
+                        dump_path=dump_path,
+                        shard_duration=int(args.shard_duration),
+                        poll=int(args.poll),
+                    )
+                )
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=len(wave_jobs)) as ex:
+                    futs = [
+                        ex.submit(
+                            _run_one_shard,
+                            api,
+                            idx,
+                            target_total_shards,
+                            shard,
+                            dump_path,
+                            int(args.shard_duration),
+                            int(args.poll),
+                        )
+                        for idx, shard, api in wave_jobs
+                    ]
+                    for fut in concurrent.futures.as_completed(futs):
+                        rows.append(fut.result())
+
+            processed += wave_n
+            cur_cursor += wave_n
 
     rows.sort(key=lambda r: int(r.get("shard_idx") or 0))
     with open(out_path, "w", newline="", encoding="utf-8") as f:

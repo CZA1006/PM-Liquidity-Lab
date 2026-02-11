@@ -28,7 +28,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .config import settings
-from .gamma import GammaClient, list_events as gamma_list_events
+from .gamma import GammaClient
 from .monitor import Monitor
 
 # NOTE:
@@ -382,56 +382,90 @@ async def gamma_active_markets(
     active_only: bool = True,
 ) -> JSONResponse:
     """
-    Enumerate ACTIVE markets (event-based; best-effort).
-    Response shape: { markets: [...], events_n: n, markets_n: m, limit, offset }
+    Enumerate markets from Gamma /markets (market-based pagination).
+    Response shape: { markets: [...], events_n: n, markets_n: m, limit, offset, active_only }
     """
-    if active_only:
-        data = await gamma_list_events(limit=limit, offset=offset, active=True, closed=False)
-    else:
-        data = await gamma_list_events(limit=limit, offset=offset, active=None, closed=None, archived=None)
+    data = await gamma_client.list_markets(
+        limit=limit,
+        offset=offset,
+        order=None,
+        ascending=False,
+        active=True if active_only else None,
+        closed=False if active_only else None,
+        archived=False if active_only else None,
+    )
+    markets = data if isinstance(data, list) else data.get("markets") or data.get("data") or []
 
-    events = data if isinstance(data, list) else data.get("events") or data.get("data") or []
+    def _is_active_market(m: Dict[str, Any]) -> bool:
+        if m.get("active") is False:
+            return False
+        if m.get("closed") is True:
+            return False
+        if m.get("archived") is True:
+            return False
+        if m.get("enableOrderBook") is False:
+            return False
+        if m.get("acceptingOrders") is False:
+            return False
+        return True
+
     out_markets: List[Dict[str, Any]] = []
-    for ev in events:
-        if not isinstance(ev, dict):
+    event_ids: set[str] = set()
+    for m in markets:
+        if not isinstance(m, dict):
             continue
-        ev_id = ev.get("id")
-        ev_title = ev.get("title") or ev.get("name")
-        ev_slug = ev.get("slug")
-        ev_category = ev.get("category")
-        ev_tags = ev.get("tags")
-        ev_start = ev.get("startDate") or ev.get("start_date")
-        ev_end = ev.get("endDate") or ev.get("end_date")
-        ev_closed = ev.get("closed")
-        ev_active = ev.get("active")
-        ev_archived = ev.get("archived")
-
-        markets = ev.get("markets") or []
-        if not isinstance(markets, list):
+        if active_only and (not _is_active_market(m)):
             continue
+        mm = dict(m)
 
-        for m in markets:
-            if not isinstance(m, dict):
-                continue
-            mm = dict(m)
+        raw = mm.get("clobTokenIds") or mm.get("clob_token_ids")
+        if raw is not None:
+            mm["clobTokenIds"] = _normalize_clob_token_ids(raw)
+
+        ev0 = None
+        evs = mm.get("events")
+        if isinstance(evs, list):
+            for ev in evs:
+                if isinstance(ev, dict):
+                    ev0 = ev
+                    break
+
+        if isinstance(ev0, dict):
+            ev_id = ev0.get("id")
             mm["event_id"] = ev_id
-            mm["event_title"] = ev_title
-            mm["event_slug"] = ev_slug
-            mm["event_category"] = ev_category
-            mm["event_tags"] = ev_tags
-            mm["event_start"] = ev_start
-            mm["event_end"] = ev_end
-            mm["event_active"] = ev_active
-            mm["event_closed"] = ev_closed
-            mm["event_archived"] = ev_archived
-            out_markets.append(mm)
+            mm["event_title"] = ev0.get("title") or ev0.get("name")
+            mm["event_slug"] = ev0.get("slug")
+            mm["event_category"] = ev0.get("category")
+            mm["event_tags"] = ev0.get("tags")
+            mm["event_start"] = ev0.get("startDate") or ev0.get("start_date")
+            mm["event_end"] = ev0.get("endDate") or ev0.get("end_date")
+            mm["event_active"] = ev0.get("active")
+            mm["event_closed"] = ev0.get("closed")
+            mm["event_archived"] = ev0.get("archived")
+            if ev_id is not None:
+                event_ids.add(str(ev_id))
+        else:
+            mm["event_id"] = mm.get("event_id")
+            mm["event_title"] = mm.get("event_title")
+            mm["event_slug"] = mm.get("event_slug")
+            mm["event_category"] = mm.get("event_category") or mm.get("category")
+            mm["event_tags"] = mm.get("event_tags") or mm.get("tags")
+            mm["event_start"] = mm.get("event_start")
+            mm["event_end"] = mm.get("event_end")
+            mm["event_active"] = mm.get("event_active")
+            mm["event_closed"] = mm.get("event_closed")
+            mm["event_archived"] = mm.get("event_archived")
+            if mm["event_id"] is not None:
+                event_ids.add(str(mm["event_id"]))
+
+        out_markets.append(mm)
 
     return JSONResponse(
         content={
             "limit": limit,
             "offset": offset,
             "active_only": active_only,
-            "events_n": len(events),
+            "events_n": len(event_ids),
             "markets": out_markets,
             "markets_n": len(out_markets),
         }

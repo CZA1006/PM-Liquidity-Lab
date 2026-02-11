@@ -187,6 +187,16 @@ Normalization fields (dump script):
 - `_event_tags_norm`: normalized tag array
 - `_event_category_norm`: normalized category string
 
+Strict active filtering (default, when `--all_events` is NOT set):
+- Request parameter: `active_only=true` against backend `/gamma/active_markets`
+- Additional conservative filter in dump script:
+  - `active == true`
+  - `closed == false`
+  - `archived == false`
+  - `enableOrderBook == true`
+  - `acceptingOrders == true`
+- This avoids mixed-status rows (for example `active=true` but `closed=true`) in capture universes.
+
 Research use:
 - Defines capture universe and temporal cohort (`--on_date`).
 - Provides category/tag dimensions for cross-market studies.
@@ -375,6 +385,10 @@ This section is a practical runbook for liquidity research using your current pi
   - wall time is roughly `ceil(S/N) * shard_duration`.
 - For a true "same 15-minute global window" over all shards:
   - need enough workers to finish all shards in one round, or increase `shard_tokens` to reduce shard count.
+- Important timing split:
+  - **Capture wall clock** = only the shard capture stage (`capture_dump_shards.py`).
+  - **End-to-end wall clock** = dump refresh + worker start/health checks + capture + shutdown.
+  - If you want a clean "15-minute" measurement, prepare dump/workers first, then time only capture.
 
 ### D) Produce visualization slices
 Use `viz_liquidity_window.py`:
@@ -434,6 +448,65 @@ Use `viz_liquidity_window.py`:
 - This pipeline is optimized for capture from "now onward".
 - `--on_date` controls market universe selection, not true time travel replay of historical L2 states.
 - Exact historical L2 at arbitrary past timestamps requires historical archival feed retention from that period.
+
+### J) Stable single-wave 15-minute full-active run (external disk)
+Goal: capture one global 15-minute window without multi-wave spillover.
+
+Preconditions:
+- External disk mounted (for example `/Volumes/T7/PolyMarket DB`)
+- Worker count chosen from capacity estimation (`estimate_capture_capacity.py`)
+- For current MacBook-class setup, common profile is:
+  - `workers=27`
+  - `shard_tokens=2000`
+  - `max_shards=27`
+
+Recommended two-stage flow:
+1. Prepare once (not timed as capture):
+   - start workers
+   - health-check all workers
+   - refresh one dump file
+2. Timed stage:
+   - run only `capture_dump_shards.py` with fixed `--dump`, fixed workers, fixed shard plan
+
+Pass criteria for single-wave 15-minute run:
+- report rows == worker count (for example `27`)
+- `duration_s` per shard near 900s (allowing poll overshoot, often up to ~930s)
+- no short shards (`duration_s < 765`)
+- `shard_tokens_sum` matches monitorable token universe for the dump
+- non-zero bytes for raw/books outputs
+
+### K) Why a "15-minute run" can exceed 15 minutes
+Most common causes:
+1. You measured end-to-end runtime, not capture-only runtime.
+2. `S > N` (shards exceed alive workers), so shards run in multiple waves.
+3. `shard_tokens` too small (creates too many shards).
+4. Poll granularity and request overhead add per-shard overshoot.
+
+Quick sanity formula:
+- `required_workers_for_one_wave = ceil(total_tokens / shard_tokens)`
+- one-wave 15-minute capture requires:
+  - `alive_workers >= required_workers_for_one_wave`
+  - and `max_shards <= alive_workers`
+
+### L) Rebase pressure diagnosis (quick)
+`rebase` is usually driven by calibration compare thresholds, not by a single cause.
+
+Check per run:
+- `tob_match_rate`
+- `mismatch_notional_p90`
+- `rebase_count / compares`
+- REST observability:
+  - `last_rest_poll_rtt_ms`
+  - `rest_poll_rtt_ms_p50/p90/p99`
+  - `snapshot_age_ms_p50/p90/p99`
+
+Interpretation guideline:
+- High `snapshot_age` with moderate RTT:
+  - upstream snapshot staleness likely dominates.
+- High RTT and high snapshot age:
+  - local/network load plus upstream effects.
+- High rebase with low TOB mismatch but high mismatch_notional:
+  - threshold sensitivity is likely too strict for current concurrency scale.
 
 ---
 ## Repo structure

@@ -135,6 +135,39 @@ def _market_in_date_window(m: Dict[str, Any], d: dt.date) -> bool:
     return True
 
 
+def _as_bool(v: Any) -> Optional[bool]:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "1", "yes", "y"):
+            return True
+        if s in ("false", "0", "no", "n", ""):
+            return False
+    return None
+
+
+def _is_strict_active_market(m: Dict[str, Any]) -> bool:
+    # Enforce a conservative "monitorable active market" policy in the dump itself.
+    active = _as_bool(m.get("active"))
+    closed = _as_bool(m.get("closed"))
+    archived = _as_bool(m.get("archived"))
+    enable_ob = _as_bool(m.get("enableOrderBook"))
+    accepting = _as_bool(m.get("acceptingOrders"))
+
+    if active is False:
+        return False
+    if closed is True:
+        return False
+    if archived is True:
+        return False
+    if enable_ob is False:
+        return False
+    if accepting is False:
+        return False
+    return True
+
+
 def _get_with_retry(url: str, timeout_s: float, retries: int, retry_sleep_s: float) -> Any:
     last_err: Optional[Exception] = None
     attempts = max(1, int(retries))
@@ -170,6 +203,7 @@ def main() -> None:
     out_parquet = os.path.join(args.out, f"active_markets-{ts}.parquet")
 
     rows: List[Dict[str, Any]] = []
+    seen_global: set[str] = set()
     offset = 0
     target_date: Optional[dt.date] = None
     if args.on_date:
@@ -193,6 +227,11 @@ def main() -> None:
         if not ms:
             break
         for m in ms:
+            key = str(m.get("id") or m.get("slug") or m.get("marketSlug") or "").strip()
+            if key:
+                if key in seen_global:
+                    continue
+                seen_global.add(key)
             # normalize a few fields useful for later pipelines
             m = dict(m)
             m["_clobTokenIds_norm"] = parse_clob_token_ids(m)
@@ -200,6 +239,8 @@ def main() -> None:
             m["_event_category_norm"] = (
                 str(m.get("event_category")).strip() if m.get("event_category") is not None else ""
             )
+            if (not args.all_events) and (not _is_strict_active_market(m)):
+                continue
             if target_date and (not _market_in_date_window(m, target_date)):
                 continue
             rows.append(m)
